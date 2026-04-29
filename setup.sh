@@ -11,6 +11,7 @@ CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-$REPO_ROOT/checkpoints}"
 PY311="${PY311:-/usr/bin/python3.11}"
 PY310="${PY310:-/usr/bin/python3.10}"
 FORCE="${FORCE:-false}"
+REFRESH_DOWNLOADS="${REFRESH_DOWNLOADS:-false}"
 export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-$CHORUS_DIR/cache/numba}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$CHORUS_DIR/cache/matplotlib}"
 mkdir -p "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR"
@@ -37,6 +38,16 @@ TORCH_VERSION="${TORCH_VERSION:-2.0.1}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.15.2}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/$TORCH_CUDA}"
 PYG_FIND_LINKS="${PYG_FIND_LINKS:-https://data.pyg.org/whl/torch-${TORCH_VERSION}+${TORCH_CUDA}.html}"
+TORCH_MAJOR_MINOR="${TORCH_VERSION%.*}"
+PYG_TORCH_TAG="${PYG_TORCH_TAG:-pt${TORCH_MAJOR_MINOR//./}${TORCH_CUDA}}"
+TORCH_SCATTER_VERSION="${TORCH_SCATTER_VERSION:-2.1.2}"
+TORCH_SPARSE_VERSION="${TORCH_SPARSE_VERSION:-0.6.18}"
+TORCH_CLUSTER_VERSION="${TORCH_CLUSTER_VERSION:-1.6.3}"
+PYG_EXTENSION_PACKAGES=(
+    "torch-scatter==${TORCH_SCATTER_VERSION}+${PYG_TORCH_TAG}"
+    "torch-sparse==${TORCH_SPARSE_VERSION}+${PYG_TORCH_TAG}"
+    "torch-cluster==${TORCH_CLUSTER_VERSION}+${PYG_TORCH_TAG}"
+)
 DIFFSBDD_PACKAGES=(
     "numpy>=1.24,<2"
     "scipy>=1.10"
@@ -68,6 +79,10 @@ POCKETXMOL_PACKAGES=(
     "tqdm"
     "openbabel-wheel"
     "scikit-learn"
+    "requests"
+    "psutil"
+    "Jinja2"
+    "pyparsing"
     "tensorboard"
     "setuptools<70"
 )
@@ -88,6 +103,7 @@ Targets:
 
 Environment overrides:
   FORCE=true      Recreate the selected env from scratch.
+  REFRESH_DOWNLOADS=true Re-download model/checkpoint archives.
   CHORUS_ROOT=PATH Default: $REPO_ROOT
   ENV_ROOT=PATH   Default: $ENV_ROOT
   MODELS_DIR=PATH Default: $MODELS_DIR
@@ -95,6 +111,7 @@ Environment overrides:
   PY311=PATH      Default: $PY311
   PY310=PATH      Default: $PY310
   TORCH_CUDA=TAG  Default: $TORCH_CUDA
+  PYG_TORCH_TAG=TAG Default: $PYG_TORCH_TAG
   BOLTZ_SPEC=SPEC Default: $BOLTZ_SPEC
 
 Examples:
@@ -190,12 +207,14 @@ uv_install_torch() {
         "$@"
 }
 
-uv_install_pyg() {
+uv_install_pyg_extensions() {
     local name="$1"
     shift
     UV_LINK_MODE=copy "$UV" pip install \
         --python "$(env_python "$name")" \
+        --no-index \
         --find-links "$PYG_FIND_LINKS" \
+        --no-deps \
         "$@"
 }
 
@@ -203,7 +222,7 @@ download_file() {
     local url="$1"
     local out="$2"
     mkdir -p "$(dirname "$out")"
-    if [[ -s "$out" && "$FORCE" != "true" ]]; then
+    if [[ -s "$out" && "$REFRESH_DOWNLOADS" != "true" ]]; then
         echo "Using existing file: $out"
         return 0
     fi
@@ -259,7 +278,7 @@ ensure_pocketxmol_weights() {
     local ckpt="$CHECKPOINTS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt"
     local train_cfg="$CHECKPOINTS_DIR/pocketxmol/data/trained_models/pxm/train_config/train.yml"
     download_file "$POCKETXMOL_WEIGHTS_URL" "$archive"
-    if [[ ! -s "$ckpt" || ! -s "$train_cfg" || "$FORCE" == "true" ]]; then
+    if [[ ! -s "$ckpt" || ! -s "$train_cfg" || "$REFRESH_DOWNLOADS" == "true" ]]; then
         echo "Extracting PocketXMol weights into $CHECKPOINTS_DIR/pocketxmol"
         tar -xzf "$archive" -C "$CHECKPOINTS_DIR/pocketxmol"
     fi
@@ -324,15 +343,18 @@ setup_diffsbdd() {
     uv_install_torch diffsbdd \
         "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
         "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA}"
-    uv_install_pyg diffsbdd torch-scatter torch-sparse torch-cluster torch-geometric
     uv_install diffsbdd --upgrade "${DIFFSBDD_PACKAGES[@]}"
+    uv_install diffsbdd --upgrade --no-deps "torch-geometric==2.7.0"
+    uv_install_pyg_extensions diffsbdd "${PYG_EXTENSION_PACKAGES[@]}"
     "$(env_python diffsbdd)" - <<'PY'
 import Bio
 import openbabel
 import pytorch_lightning
 import rdkit
 import torch
+import torch_cluster
 import torch_scatter
+import torch_sparse
 print("diffsbdd env ok", torch.__version__)
 PY
 }
@@ -343,8 +365,9 @@ setup_pocketxmol() {
     link_pocketxmol_weights_into_repo
     make_env pocketxmol "$PY310"
     uv_install_torch pocketxmol "torch==${TORCH_VERSION}+${TORCH_CUDA}"
-    uv_install_pyg pocketxmol torch-scatter torch-sparse torch-cluster "torch_geometric==2.3.0"
     uv_install pocketxmol --upgrade "${POCKETXMOL_PACKAGES[@]}"
+    uv_install pocketxmol --upgrade --no-deps "torch-geometric==2.3.0"
+    uv_install_pyg_extensions pocketxmol "${PYG_EXTENSION_PACKAGES[@]}"
     "$(env_python pocketxmol)" - <<'PY'
 import Bio
 import easydict
@@ -352,8 +375,10 @@ import lmdb
 import openbabel
 import rdkit
 import torch
+import torch_cluster
 import torch_geometric
 import torch_scatter
+import torch_sparse
 print("pocketxmol env ok", torch.__version__)
 PY
 }
@@ -427,9 +452,9 @@ check_all() {
     check_env boltz || status=1
     check_script boltz boltz || status=1
     check_env diffsbdd || status=1
-    check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import pytorch_lightning, rdkit, torch, torch_scatter" || status=1
+    check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import pytorch_lightning, rdkit, torch, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_env pocketxmol || status=1
-    check_imports pocketxmol "from openbabel import openbabel; import Bio, easydict, lmdb, rdkit, torch, torch_geometric, torch_scatter" || status=1
+    check_imports pocketxmol "from openbabel import openbabel; import Bio, easydict, lmdb, rdkit, torch, torch_geometric, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_path "diffsbdd repo" "$MODELS_DIR/diffsbdd/generate_ligands.py" || status=1
     check_path "diffsbdd checkpoint" "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_cond.ckpt" || status=1
     check_path "pocketxmol repo" "$MODELS_DIR/pocketxmol/scripts/sample_use.py" || status=1
