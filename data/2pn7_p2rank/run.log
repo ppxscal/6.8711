@@ -1,0 +1,44 @@
+[INFO] Console - predicting pockets for proteins from dataset [2pn7.pdb]
+[INFO] PredictPocketsRoutine - outdir: /data2/ppxscal/chorus/data/2pn7_p2rank
+[INFO] FeatureSetup - enabledFeatures: [chem, volsite, protrusion, bfactor, atom_table]
+[INFO] Dataset - processing dataset [2pn7.pdb] using 0 threads
+[INFO] Dataset - 
+------------------------------------------------------------------------------------------------------------------------
+processing [2pn7.pdb] (1/1)
+------------------------------------------------------------------------------------------------------------------------
+
+[INFO] Console - processing [2pn7.pdb] (1/1)
+[INFO] Protein - loading protein [/data2/ppxscal/chorus/data/2pn7.pdb]
+[INFO] PdbUtils - loading file [/data2/ppxscal/chorus/data/2pn7.pdb]
+[INFO] Struct - all groups in chain A: 169
+[INFO] Struct - all groups in chain B: 169
+[INFO] Struct - all groups in chain A: 169
+[INFO] Struct - 169 groups in chain A
+[INFO] Struct - all groups in chain B: 169
+[INFO] Struct - 169 groups in chain B
+[INFO] Protein - structure atoms: 2715
+[INFO] Protein - protein   atoms: 2643
+[INFO] Protein - ignoring ligands
+[INFO] FeatureSetup - enabledFeatures: [chem, volsite, protrusion, bfactor, atom_table]
+[INFO] Protein - SAS points: 5145
+[INFO] Protein - exposed protein atoms: 1762 of 2643
+[INFO] InstancePredictor - Creating WekaInstancePredictor
+[INFO] SLinkClusterer - clustering [100] elements
+[INFO] SLinkClusterer - clusters: [id:16( 1 ), id:33( 40 ), id:36( 1 ), id:42( 3 ), id:53( 1 ), id:54( 1 ), id:90( 34 ), id:91( 1 ), id:95( 9 ), id:97( 6 ), id:98( 3 )]
+[INFO] SLinkClusterer - clusters together: 100 / 100
+[INFO] PocketPredictor - PREDICTING POCKETS.... ====================================
+[INFO] PocketPredictor - SAS POINTS: 5145
+[INFO] PocketPredictor - LIGANDABLE POINTS: 100
+[INFO] PocketPredictor - CLUSTERS: 11
+[INFO] PocketPredictor - FILTERED CLUSTERS: 6
+[INFO] PocketPredictor - pocket 1 -  surf_atoms:  44   points:  40   score:   11.6
+[INFO] PocketPredictor - pocket 2 -  surf_atoms:  38   points:  34   score:   11.3
+[INFO] PocketPredictor - pocket 3 -  surf_atoms:  17   points:   6   score:    2.9
+[INFO] PocketPredictor - pocket 4 -  surf_atoms:  25   points:   9   score:    2.8
+[INFO] PocketPredictor - pocket 5 -  surf_atoms:  21   points:   3   score:    1.4
+[INFO] PocketPredictor - pocket 6 -  surf_atoms:  11   points:   3   score:    0.8
+[INFO] OldPymolRenderer - copying [/data2/ppxscal/chorus/data/2pn7.pdb] to [/data2/ppxscal/chorus/data/2pn7_p2rank/visualizations/data/2pn7.pdb]
+[INFO] Console - predicting pockets finished in 0 hours 0 minutes 6.809 seconds
+[INFO] Console - results saved to directory [/data2/ppxscal/chorus/data/2pn7_p2rank]
+[INFO] Console - 
+[INFO] Console - Finished successfully in 0 hours 0 minutes 7.931 seconds.
