@@ -276,6 +276,36 @@ ensure_diffsbdd_repo() {
 
 ensure_pocketxmol_repo() {
     clone_repo "$POCKETXMOL_REPO_URL" "$MODELS_DIR/pocketxmol"
+    patch_pocketxmol_rdkit_six
+}
+
+patch_pocketxmol_rdkit_six() {
+    local scorer="$MODELS_DIR/pocketxmol/utils/sascorer.py"
+    if [[ ! -f "$scorer" ]]; then
+        return 0
+    fi
+    if grep -q "rdkit.six" "$scorer"; then
+        echo "Patching PocketXMol RDKit compatibility: $scorer"
+        "$PY310" - "$scorer" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+text = text.replace(
+    "from rdkit import Chem\n"
+    "from rdkit.Chem import rdMolDescriptors\n"
+    "from rdkit.six.moves import cPickle\n"
+    "from rdkit.six import iteritems\n",
+    "import pickle\n"
+    "from rdkit import Chem\n"
+    "from rdkit.Chem import rdMolDescriptors\n",
+)
+text = text.replace("cPickle.load(", "pickle.load(")
+text = text.replace("iteritems(fps)", "fps.items()")
+path.write_text(text)
+PY
+    fi
 }
 
 ensure_diffsbdd_checkpoint() {

@@ -4,10 +4,10 @@ set -euo pipefail
 CHORUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Defaults are chosen for the six-day term-project run:
-# 5 targets x 2 pockets x 3 generators x 1000 samples ~= 30k raw samples.
+# 5 targets x 4 pockets x 3 generators x 1000 samples ~= 60k raw samples.
 RUN_PREFIX="${RUN_PREFIX:-panel_$(date +%Y%m%d)}"
 N_PER_POCKET="${N_PER_POCKET:-1000}"
-P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-2}"
+P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 GENERATORS="${GENERATORS:-DiffSBDD,PocketXMol,PocketXMolAR}"
 MODE="${MODE:-real}"
