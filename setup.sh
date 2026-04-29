@@ -207,6 +207,16 @@ uv_install_torch() {
         "$@"
 }
 
+uv_install_with_torch_index() {
+    local name="$1"
+    shift
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python "$name")" \
+        --index-url https://pypi.org/simple \
+        --extra-index-url "$TORCH_INDEX_URL" \
+        "$@"
+}
+
 uv_install_pyg_extensions() {
     local name="$1"
     shift
@@ -343,8 +353,11 @@ setup_diffsbdd() {
     uv_install_torch diffsbdd \
         "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
         "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA}"
-    uv_install diffsbdd --upgrade "${DIFFSBDD_PACKAGES[@]}"
-    uv_install diffsbdd --upgrade --no-deps "torch-geometric==2.7.0"
+    uv_install_with_torch_index diffsbdd --upgrade \
+        "${DIFFSBDD_PACKAGES[@]}" \
+        "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
+        "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA}"
+    uv_install diffsbdd "torch-geometric==2.7.0"
     uv_install_pyg_extensions diffsbdd "${PYG_EXTENSION_PACKAGES[@]}"
     "$(env_python diffsbdd)" - <<'PY'
 import Bio
@@ -365,8 +378,10 @@ setup_pocketxmol() {
     link_pocketxmol_weights_into_repo
     make_env pocketxmol "$PY310"
     uv_install_torch pocketxmol "torch==${TORCH_VERSION}+${TORCH_CUDA}"
-    uv_install pocketxmol --upgrade "${POCKETXMOL_PACKAGES[@]}"
-    uv_install pocketxmol --upgrade --no-deps "torch-geometric==2.3.0"
+    uv_install_with_torch_index pocketxmol --upgrade \
+        "${POCKETXMOL_PACKAGES[@]}" \
+        "torch==${TORCH_VERSION}+${TORCH_CUDA}"
+    uv_install pocketxmol "torch-geometric==2.3.0"
     uv_install_pyg_extensions pocketxmol "${PYG_EXTENSION_PACKAGES[@]}"
     "$(env_python pocketxmol)" - <<'PY'
 import Bio
