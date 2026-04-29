@@ -214,6 +214,7 @@ uv_install_with_torch_index() {
         --python "$(env_python "$name")" \
         --index-url https://pypi.org/simple \
         --extra-index-url "$TORCH_INDEX_URL" \
+        --index-strategy unsafe-best-match \
         "$@"
 }
 
