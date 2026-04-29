@@ -2,14 +2,18 @@
 set -euo pipefail
 
 CHORUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$CHORUS_DIR")"
+REPO_ROOT="${CHORUS_ROOT:-$CHORUS_DIR}"
+ENV_ROOT="${ENV_ROOT:-$REPO_ROOT/envs/uv}"
+ENVS_DIR="${ENVS_DIR:-$(dirname "$ENV_ROOT")}"
+MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/models}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-$REPO_ROOT/checkpoints}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$CHORUS_DIR/cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
 _find_python() {
     for candidate in \
-        "$REPO_ROOT/envs/uv/chorus/bin/python" \
-        "$REPO_ROOT/envs/uv/diffsbdd/bin/python" \
+        "$ENV_ROOT/chorus/bin/python" \
+        "$ENV_ROOT/diffsbdd/bin/python" \
         "$REPO_ROOT/unicellular/.venv/bin/python" \
         "$(which python3 2>/dev/null)"; do
         if [[ -x "$candidate" ]] && "$candidate" -c "import rdkit, pandas, torch" 2>/dev/null; then
@@ -69,19 +73,28 @@ trap 'rm -f "$TMPPY"' EXIT
 QUIET_PY=$( [[ "$QUIET" == "true" ]] && echo "True" || echo "False" )
 
 cat > "$TMPPY" <<PYEOF
-import sys, dataclasses
+import sys, dataclasses, types
 from pathlib import Path
-sys.path.insert(0, "$REPO_ROOT")
+
+_repo = Path("$REPO_ROOT").resolve()
+_chorus = Path("$CHORUS_DIR").resolve()
+sys.path.insert(0, str(_repo))
+sys.path.insert(0, str(_chorus))
+if "chorus" not in sys.modules:
+    _pkg = types.ModuleType("chorus")
+    _pkg.__path__ = [str(_chorus)]
+    sys.modules["chorus"] = _pkg
 
 from chorus.pipeline import Config, Paths, run_pipeline
 
-_repo = Path("$REPO_ROOT")
-_chorus = Path("$CHORUS_DIR")
 paths = Paths.from_root(_repo)
 paths = dataclasses.replace(
     paths,
     results_dir=_chorus / "results",
     data_dir=_chorus / "data",
+    models_dir=Path("$MODELS_DIR"),
+    checkpoints_dir=Path("$CHECKPOINTS_DIR"),
+    envs_dir=Path("$ENVS_DIR"),
     cache_dir=_chorus / "cache",
     boltz_cache_dir=_chorus / "cache" / "boltz",
     msa_cache_dir=_chorus / "cache" / "boltz" / "msa",
