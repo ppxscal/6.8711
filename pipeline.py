@@ -11,7 +11,6 @@ import json
 import os
 import shutil
 import tarfile
-import tempfile
 import threading
 import time
 import urllib.request
@@ -600,15 +599,28 @@ class BoltzCliOracle:
             if found:
                 self.binary = Path(found)
         self.python = env_python("boltz", cfg.paths)
-        self.cache_path = cfg.paths.results_dir / "boltz_cache.json"
-        self.cache: dict[str, dict[str, float | None]] = (
-            json.loads(self.cache_path.read_text()) if self.cache_path.exists() else {}
-        )
         seq_hash = hashlib.sha256(self.spec.protein_sequence.encode()).hexdigest()[:12]
-        target_slug = cfg.target_name.lower()
+        target_slug = "".join(
+            c if c.isalnum() or c in ("-", "_") else "_"
+            for c in cfg.target_name.lower()
+        ).strip("_") or "target"
+        self.target_cache_slug = f"{target_slug}_{self.spec.protein_chain}_{seq_hash}"
+        score_cache_dir = cfg.paths.boltz_cache_dir / "scores"
+        score_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_path = score_cache_dir / f"{self.target_cache_slug}.json"
+        legacy_cache_path = cfg.paths.results_dir / "boltz_cache.json"
+        cache_source = self.cache_path if self.cache_path.exists() else legacy_cache_path
+        self.cache: dict[str, dict[str, float | None]] = (
+            json.loads(cache_source.read_text()) if cache_source.exists() else {}
+        )
+        self.scoring_run_dir = (
+            cfg.paths.boltz_cache_dir
+            / "scoring_runs"
+            / f"{self.target_cache_slug}_affinity_s100_d1"
+        )
         self.msa_cache_path = (
             cfg.paths.msa_cache_dir
-            / f"{target_slug}_{self.spec.protein_chain}_{seq_hash}.csv"
+            / f"{self.target_cache_slug}.csv"
         )
 
     def ready(self) -> bool:
@@ -718,6 +730,15 @@ class BoltzCliOracle:
         ]
         out_path.write_text("\n".join(lines))
 
+    def _stem_for_smiles(self, smiles: str) -> str:
+        return f"mol_{hashlib.sha256(smiles.encode()).hexdigest()[:16]}"
+
+    def _write_score_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(self.cache, indent=2))
+        tmp_path.replace(self.cache_path)
+
     def _parse_result(self, predictions_dir: Path, stem: str) -> dict[str, float | None]:
         """Parse affinity result for a single YAML stem from a batch predictions dir."""
         candidate_dir = predictions_dir / stem
@@ -743,6 +764,13 @@ class BoltzCliOracle:
             return False
         return any(candidate_dir.rglob("affinity_*.json")) or any(candidate_dir.rglob("confidence_*.json"))
 
+    def _parse_persistent_prediction(self, smiles: str) -> dict[str, float | None] | None:
+        stem = self._stem_for_smiles(smiles)
+        for predictions_dir in self.scoring_run_dir.glob("gpu_*/outputs/boltz_results_inputs/predictions"):
+            if self._has_result_file(predictions_dir, stem):
+                return self._parse_result(predictions_dir, stem)
+        return None
+
     def _score_chunk(
         self,
         chunk: list[tuple[int, str]],   # (original_index, smiles)
@@ -762,7 +790,7 @@ class BoltzCliOracle:
         # Map filename stem → (original_index, smiles)
         stem_map: dict[str, tuple[int, str]] = {}
         for idx, smi in chunk:
-            stem = f"mol_{idx:06d}"
+            stem = self._stem_for_smiles(smi)
             self._write_yaml(smi, yaml_dir / f"{stem}.yaml")
             stem_map[stem] = (idx, smi)
 
@@ -838,25 +866,41 @@ class BoltzCliOracle:
         }
         results: list[dict[str, float | None] | None] = [None] * len(smiles_list)
         pending: list[tuple[int, str]] = []
+        recovered = 0
 
         for i, smi in enumerate(smiles_list):
             cached = self.cache.get(smi)
             if cached is not None:
                 results[i] = cached
+                continue
+            persisted = self._parse_persistent_prediction(smi)
+            if persisted is not None:
+                self.cache[smi] = persisted
+                results[i] = persisted
+                recovered += 1
             else:
                 pending.append((i, smi))
 
         if not pending:
+            if recovered:
+                self._write_score_cache()
             return [r if r is not None else null_result for r in results]
+
+        if recovered:
+            self._write_score_cache()
+            print(f"Recovered {recovered} Boltz scores from persistent cache.", flush=True)
 
         self._ensure_boltz_runtime_cache()
         devices = self._get_devices()
         n_gpus = len(devices)
 
-        # Split pending molecules evenly across GPUs
+        # Split pending molecules deterministically across GPUs so each SMILES
+        # returns to the same Boltz output shard on restart.
         chunks: list[list[tuple[int, str]]] = [[] for _ in range(n_gpus)]
-        for i, item in enumerate(pending):
-            chunks[i % n_gpus].append(item)
+        for item in pending:
+            _, smi = item
+            shard = int(hashlib.sha256(smi.encode()).hexdigest(), 16) % n_gpus
+            chunks[shard].append(item)
 
         print(
             f"Boltz scoring {len(pending)} ligands across {n_gpus} GPUs "
@@ -864,55 +908,56 @@ class BoltzCliOracle:
             flush=True,
         )
 
-        with tempfile.TemporaryDirectory() as base_tmp:
-            base = Path(base_tmp)
+        self.scoring_run_dir.mkdir(parents=True, exist_ok=True)
+        base = self.scoring_run_dir
 
-            score_lock = threading.Lock()
-            progress_bar = tqdm(
-                total=len(smiles_list),
-                initial=len(smiles_list) - len(pending),
-                desc="Boltz scored ligands",
-                unit="ligand",
-                dynamic_ncols=True,
+        score_lock = threading.Lock()
+        progress_bar = tqdm(
+            total=len(smiles_list),
+            initial=len(smiles_list) - len(pending),
+            desc="Boltz scored ligands",
+            unit="ligand",
+            dynamic_ncols=True,
+        )
+
+        def _record_scored(delta: int) -> None:
+            if delta <= 0:
+                return
+            with score_lock:
+                progress_bar.update(delta)
+
+        def _run_gpu(gpu_idx: int) -> list[tuple[int, str, dict]]:
+            chunk = chunks[gpu_idx]
+            if not chunk:
+                return []
+            work_dir = base / f"gpu_{gpu_idx}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return self._score_chunk(
+                chunk,
+                devices[gpu_idx],
+                work_dir,
+                progress_callback=_record_scored,
             )
 
-            def _record_scored(delta: int) -> None:
-                if delta <= 0:
-                    return
-                with score_lock:
-                    progress_bar.update(delta)
-
-            def _run_gpu(gpu_idx: int) -> list[tuple[int, str, dict]]:
-                chunk = chunks[gpu_idx]
-                if not chunk:
-                    return []
-                work_dir = base / f"gpu_{gpu_idx}"
-                work_dir.mkdir()
-                return self._score_chunk(
-                    chunk,
-                    devices[gpu_idx],
-                    work_dir,
-                    progress_callback=_record_scored,
-                )
-
-            scored = 0
-            try:
-                with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-                    gpu_futures = {executor.submit(_run_gpu, i): i for i in range(n_gpus)}
-                    for future in as_completed(gpu_futures):
-                        gpu_idx = gpu_futures[future]
-                        try:
-                            for orig_idx, smi, result in future.result():
-                                results[orig_idx] = result
-                                self.cache[smi] = result
-                                scored += 1
-                        except Exception as exc:
-                            print(f"Boltz GPU {devices[gpu_idx]} chunk failed: {exc}", flush=True)
-            finally:
-                progress_bar.close()
+        scored = 0
+        try:
+            with ThreadPoolExecutor(max_workers=n_gpus) as executor:
+                gpu_futures = {executor.submit(_run_gpu, i): i for i in range(n_gpus)}
+                for future in as_completed(gpu_futures):
+                    gpu_idx = gpu_futures[future]
+                    try:
+                        for orig_idx, smi, result in future.result():
+                            results[orig_idx] = result
+                            self.cache[smi] = result
+                            scored += 1
+                        self._write_score_cache()
+                    except Exception as exc:
+                        print(f"Boltz GPU {devices[gpu_idx]} chunk failed: {exc}", flush=True)
+        finally:
+            progress_bar.close()
 
         print(f"Boltz scoring complete: {scored}/{len(pending)} succeeded.", flush=True)
-        self.cache_path.write_text(json.dumps(self.cache, indent=2))
+        self._write_score_cache()
         return [r if r is not None else null_result for r in results]
 
 
@@ -1781,13 +1826,18 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
     # Phase 2: Score all unique molecules with Boltz (no proxy pre-filter)
     oracle = BoltzCliOracle(pocket_specs[0], cfg)
     all_smiles = unique_df["smiles"].tolist()
-    print(f"\nBoltz scoring {len(all_smiles)} unique molecules ...", flush=True)
-    annotations = oracle.score(all_smiles)
-    merged = unique_df.copy()
-    merged["rank_score"] = [a.get("rank_score") for a in annotations]
-    merged["affinity_probability_binary"] = [a.get("affinity_probability_binary") for a in annotations]
-    merged["affinity_pred_value"] = [a.get("affinity_pred_value") for a in annotations]
-    merged.to_csv(run_dir / "scored_candidates.csv", index=False)
+    scored_candidates_path = run_dir / "scored_candidates.csv"
+    if scored_candidates_path.exists():
+        print(f"\nBoltz scoring: resuming from {scored_candidates_path.name}", flush=True)
+        merged = pd.read_csv(scored_candidates_path)
+    else:
+        print(f"\nBoltz scoring {len(all_smiles)} unique molecules ...", flush=True)
+        annotations = oracle.score(all_smiles)
+        merged = unique_df.copy()
+        merged["rank_score"] = [a.get("rank_score") for a in annotations]
+        merged["affinity_probability_binary"] = [a.get("affinity_probability_binary") for a in annotations]
+        merged["affinity_pred_value"] = [a.get("affinity_pred_value") for a in annotations]
+        merged.to_csv(scored_candidates_path, index=False)
 
     # Top hits
     ranked = merged.copy()
