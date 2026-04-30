@@ -22,11 +22,11 @@ mkdir -p "$LOG_DIR"
 # Keep this panel small enough that Boltz scoring completes with time left for analysis.
 TARGETS=(
     "8VF6 STK33"
+    "2PN7 GGCT"
     "4W9H VHL"
     "4CI2 CRBN"
     "3MXF BRD4_BD1"
     "5P9J BTK"
-    "2PN7 GGCT"
     # Optional swap-in if you want a protein-protein-interaction pocket:
     # "4HG7 MDM2"
 )
