@@ -59,6 +59,7 @@ DIFFSBDD_PACKAGES=(
     "torchmetrics==1.4.2"
     "wandb==0.13.1"
     "seaborn"
+    "hdbscan"
     "tqdm"
     "openbabel-wheel"
     "gemmi"
@@ -498,7 +499,7 @@ check_all() {
     check_env boltz || status=1
     check_script boltz boltz || status=1
     check_env diffsbdd || status=1
-    check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import pytorch_lightning, rdkit, torch, torch_scatter, torch_sparse, torch_cluster" || status=1
+    check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import hdbscan, pytorch_lightning, rdkit, torch, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_env pocketxmol || status=1
     check_imports pocketxmol "from openbabel import openbabel; import Bio, easydict, lmdb, rdkit, torch, torch_geometric, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_path "diffsbdd repo" "$MODELS_DIR/diffsbdd/generate_ligands.py" || status=1

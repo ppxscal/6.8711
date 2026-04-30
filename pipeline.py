@@ -654,6 +654,57 @@ class BoltzCliOracle:
             raise RuntimeError(f"Expected cached MSA at {self.msa_cache_path}")
         return self.msa_cache_path
 
+    def _ensure_boltz_runtime_cache(self) -> None:
+        """Initialize Boltz model/CCD cache before parallel GPU workers use it."""
+        if not self.python.exists():
+            raise RuntimeError("Boltz Python env missing; cannot initialize Boltz cache.")
+        cache_dir = self._cfg.paths.boltz_cache_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        script = "\n".join([
+            "from pathlib import Path",
+            "import shutil",
+            "import tarfile",
+            "import time",
+            "from boltz.data import const",
+            "from boltz.main import download_boltz2",
+            f"cache = Path({str(cache_dir)!r})",
+            "cache.mkdir(parents=True, exist_ok=True)",
+            "mols = cache / 'mols'",
+            "tar_mols = cache / 'mols.tar'",
+            "def quarantine(path, reason):",
+            "    if not path.exists():",
+            "        return",
+            "    dest = path.with_name(f'{path.name}.corrupt.{int(time.time())}')",
+            "    print(f'Quarantining corrupt Boltz cache {path}: {reason}')",
+            "    shutil.move(str(path), str(dest))",
+            "def missing_canonicals():",
+            "    return [x for x in const.canonical_tokens if not (mols / f'{x}.pkl').exists()]",
+            "if mols.exists():",
+            "    missing = missing_canonicals()",
+            "    if missing:",
+            "        quarantine(mols, 'missing canonical CCD components: ' + ', '.join(missing[:5]))",
+            "        quarantine(tar_mols, 'paired with incomplete mols directory')",
+            "elif tar_mols.exists():",
+            "    try:",
+            "        with tarfile.open(str(tar_mols), 'r') as tar:",
+            "            names = {m.name for m in tar.getmembers()}",
+            "        if 'mols/ALA.pkl' not in names:",
+            "            quarantine(tar_mols, 'missing mols/ALA.pkl')",
+            "    except Exception as exc:",
+            "        quarantine(tar_mols, f'unreadable tar: {exc}')",
+            "download_boltz2(cache)",
+            "missing = missing_canonicals()",
+            "if missing:",
+            "    raise RuntimeError('Boltz CCD cache is incomplete; missing: ' + ', '.join(missing[:10]))",
+            "print(f'Boltz cache ready: {cache}')",
+        ])
+        env = os.environ.copy()
+        env["BOLTZ_CACHE"] = str(cache_dir)
+        numba_cache_dir = cache_dir / "numba"
+        numba_cache_dir.mkdir(parents=True, exist_ok=True)
+        env["NUMBA_CACHE_DIR"] = str(numba_cache_dir)
+        run_command([str(self.python), "-c", script], env=env, stream=True, quiet=self._cfg.quiet)
+
     def _write_yaml(self, smiles: str, out_path: Path) -> None:
         msa_path = self._ensure_cached_msa()
         lines = [
@@ -763,6 +814,7 @@ class BoltzCliOracle:
         if not pending:
             return [r if r is not None else null_result for r in results]
 
+        self._ensure_boltz_runtime_cache()
         devices = self._get_devices()
         n_gpus = len(devices)
 

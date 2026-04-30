@@ -16,12 +16,13 @@ _find_python() {
         "$ENV_ROOT/diffsbdd/bin/python" \
         "$REPO_ROOT/unicellular/.venv/bin/python" \
         "$(which python3 2>/dev/null)"; do
-        if [[ -x "$candidate" ]] && "$candidate" -c "import rdkit, pandas, torch" 2>/dev/null; then
+        if [[ -x "$candidate" ]] && "$candidate" -c "import hdbscan, rdkit, pandas, torch" 2>/dev/null; then
             echo "$candidate"
             return 0
         fi
     done
-    echo "Error: could not find a Python with rdkit, pandas, and torch installed." >&2
+    echo "Error: could not find a Python with hdbscan, rdkit, pandas, and torch installed." >&2
+    echo "Run: bash setup.sh diffsbdd" >&2
     return 1
 }
 PYTHON="$(_find_python)"
