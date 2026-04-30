@@ -47,6 +47,7 @@ try:
 except ImportError:
     PCA = None  # type: ignore[assignment]
 
+from rdkit import Chem
 from rdkit.Chem import Draw
 
 
@@ -121,6 +122,11 @@ class Config:
     boltz_msa_server_url:       str = "https://api.colabfold.com"
     boltz_msa_pairing_strategy: str = "greedy"
     boltz_timeout_sec:          int = 600
+
+    scorer: str = "boltz"
+    rtmscore_model_name: str = "rtmscore_model1.pth"
+    rtmscore_cutoff_angstrom: float = 10.0
+    rtmscore_parallel_graphs: bool = False
 
     max_pca_points: int = 5000
     quiet:          bool = True
@@ -763,6 +769,12 @@ class BoltzCliOracle:
             return False
         return any(candidate_dir.rglob("affinity_*.json"))
 
+    def _has_structure_file(self, predictions_dir: Path, stem: str) -> bool:
+        candidate_dir = predictions_dir / stem
+        if not candidate_dir.exists():
+            return False
+        return any(candidate_dir.rglob("confidence_*.json"))
+
     def _parse_persistent_prediction(self, smiles: str) -> dict[str, float | None] | None:
         stem = self._stem_for_smiles(smiles)
         for predictions_dir in self.scoring_run_dir.glob("gpu_*/outputs/boltz_results_inputs/predictions"):
@@ -775,7 +787,8 @@ class BoltzCliOracle:
         chunk: list[tuple[int, str]],   # (original_index, smiles)
         device: str,
         work_dir: Path,
-        progress_callback: Callable[[int], None] | None = None,
+        score_progress_callback: Callable[[int], None] | None = None,
+        structure_progress_callback: Callable[[int], None] | None = None,
     ) -> list[tuple[int, str, dict[str, float | None]]]:
         """Score a chunk of molecules on one GPU by calling boltz predict once."""
         if self.binary is None:
@@ -800,23 +813,33 @@ class BoltzCliOracle:
         # boltz predict <dir> writes to out_dir/boltz_results_<dir.stem>/predictions/
         predictions_dir = out_dir / f"boltz_results_{yaml_dir.name}" / "predictions"
 
-        reported: set[str] = set()
+        reported_scores: set[str] = set()
+        reported_structures: set[str] = set()
         stop_monitor = threading.Event()
 
         def _monitor_results() -> None:
             while not stop_monitor.is_set():
-                newly_done = [
+                newly_structured = [
                     stem for stem in stem_map
-                    if stem not in reported and self._has_result_file(predictions_dir, stem)
+                    if stem not in reported_structures and self._has_structure_file(predictions_dir, stem)
                 ]
-                if newly_done:
-                    reported.update(newly_done)
-                    if progress_callback is not None:
-                        progress_callback(len(newly_done))
+                if newly_structured:
+                    reported_structures.update(newly_structured)
+                    if structure_progress_callback is not None:
+                        structure_progress_callback(len(newly_structured))
+
+                newly_scored = [
+                    stem for stem in stem_map
+                    if stem not in reported_scores and self._has_result_file(predictions_dir, stem)
+                ]
+                if newly_scored:
+                    reported_scores.update(newly_scored)
+                    if score_progress_callback is not None:
+                        score_progress_callback(len(newly_scored))
                 stop_monitor.wait(5.0)
 
         monitor_thread = threading.Thread(target=_monitor_results, daemon=True)
-        if progress_callback is not None:
+        if score_progress_callback is not None or structure_progress_callback is not None:
             monitor_thread.start()
 
         results = []
@@ -843,11 +866,14 @@ class BoltzCliOracle:
                 results.append((orig_idx, smi, result))
         finally:
             stop_monitor.set()
-            if progress_callback is not None:
+            if score_progress_callback is not None or structure_progress_callback is not None:
                 monitor_thread.join(timeout=1.0)
-                remaining = len(stem_map) - len(reported)
-                if command_completed and remaining:
-                    progress_callback(remaining)
+                remaining_structures = len(stem_map) - len(reported_structures)
+                if command_completed and remaining_structures and structure_progress_callback is not None:
+                    structure_progress_callback(remaining_structures)
+                remaining_scores = len(stem_map) - len(reported_scores)
+                if command_completed and remaining_scores and score_progress_callback is not None:
+                    score_progress_callback(remaining_scores)
         return results
 
     def _get_devices(self) -> list[str]:
@@ -910,20 +936,35 @@ class BoltzCliOracle:
         self.scoring_run_dir.mkdir(parents=True, exist_ok=True)
         base = self.scoring_run_dir
 
-        score_lock = threading.Lock()
-        progress_bar = tqdm(
+        progress_lock = threading.Lock()
+        structure_bar = tqdm(
+            total=len(smiles_list),
+            initial=len(smiles_list) - len(pending),
+            desc="Boltz structures",
+            unit="ligand",
+            dynamic_ncols=True,
+            position=0,
+        )
+        score_bar = tqdm(
             total=len(smiles_list),
             initial=len(smiles_list) - len(pending),
             desc="Boltz scored ligands",
             unit="ligand",
             dynamic_ncols=True,
+            position=1,
         )
 
         def _record_scored(delta: int) -> None:
             if delta <= 0:
                 return
-            with score_lock:
-                progress_bar.update(delta)
+            with progress_lock:
+                score_bar.update(delta)
+
+        def _record_structured(delta: int) -> None:
+            if delta <= 0:
+                return
+            with progress_lock:
+                structure_bar.update(delta)
 
         def _run_gpu(gpu_idx: int) -> list[tuple[int, str, dict]]:
             chunk = chunks[gpu_idx]
@@ -935,7 +976,8 @@ class BoltzCliOracle:
                 chunk,
                 devices[gpu_idx],
                 work_dir,
-                progress_callback=_record_scored,
+                score_progress_callback=_record_scored,
+                structure_progress_callback=_record_structured,
             )
 
         scored = 0
@@ -953,11 +995,477 @@ class BoltzCliOracle:
                     except Exception as exc:
                         print(f"Boltz GPU {devices[gpu_idx]} chunk failed: {exc}", flush=True)
         finally:
-            progress_bar.close()
+            score_bar.close()
+            structure_bar.close()
 
         print(f"Boltz scoring complete: {scored}/{len(pending)} succeeded.", flush=True)
         self._write_score_cache()
         return [r if r is not None else null_result for r in results]
+
+
+# ---------------------------------------------------------------------------
+# RTMScore pose scorer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PoseRecord:
+    pose_id: str
+    smiles: str
+    generator: str
+    pocket_id: str
+    source_rank: int
+    pose_sdf: str
+    source: str
+
+
+def _canonical_smiles_from_mol(mol: Chem.Mol) -> str | None:
+    try:
+        clean = Chem.Mol(mol)
+        try:
+            clean = Chem.RemoveHs(clean)
+        except Exception:
+            pass
+        return Chem.MolToSmiles(clean) or None
+    except Exception:
+        return None
+
+
+def _first_mol_from_sdf(path: Path) -> Chem.Mol | None:
+    try:
+        supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+        for mol in supplier:
+            if mol is not None:
+                return mol
+    except Exception:
+        return None
+    return None
+
+
+def _pose_id_for(*parts: object) -> str:
+    key = "|".join(str(p) for p in parts)
+    return f"pose_{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+
+
+def _allowed_pose_keys(generated_df: pd.DataFrame) -> set[tuple[str, str, str]]:
+    if generated_df.empty:
+        return set()
+    return {
+        (str(r.generator), str(r.pocket_id), str(r.smiles))
+        for r in generated_df[["generator", "pocket_id", "smiles"]].itertuples(index=False)
+    }
+
+
+def _latest_gen_info_by_pocket(generator_root: Path) -> dict[str, Path]:
+    latest: dict[str, Path] = {}
+    for csv_path in generator_root.rglob("gen_info.csv"):
+        try:
+            pocket_id = csv_path.relative_to(generator_root).parts[0]
+        except Exception:
+            continue
+        current = latest.get(pocket_id)
+        if current is None or csv_path.stat().st_mtime >= current.stat().st_mtime:
+            latest[pocket_id] = csv_path
+    return latest
+
+
+def _find_pxm_pose_sdf(csv_path: Path, filename: str) -> Path | None:
+    filename = filename.strip()
+    if not filename:
+        return None
+    candidates = [
+        csv_path.parent / f"{csv_path.parent.name}_SDF" / filename,
+        csv_path.parent / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    matches = sorted(csv_path.parent.rglob(filename))
+    return matches[0] if matches else None
+
+
+def _collect_pocketxmol_pose_records(
+    run_dir: Path,
+    generated_df: pd.DataFrame,
+    generator_name: str,
+    allowed: set[tuple[str, str, str]],
+) -> list[tuple[PoseRecord, Chem.Mol]]:
+    rows: list[tuple[PoseRecord, Chem.Mol]] = []
+    root = run_dir / "generator_outputs" / generator_name.lower()
+    if not root.exists():
+        return rows
+
+    for pocket_id, csv_path in sorted(_latest_gen_info_by_pocket(root).items()):
+        try:
+            info = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        if "filename" not in info.columns or "smiles" not in info.columns:
+            continue
+
+        for row_idx, row in info.iterrows():
+            filename = str(row.get("filename") or "")
+            if not filename or filename.lower() == "nan":
+                continue
+            sdf_path = _find_pxm_pose_sdf(csv_path, filename)
+            if sdf_path is None or "-bad" in sdf_path.stem:
+                continue
+
+            mol = _first_mol_from_sdf(sdf_path)
+            if mol is None:
+                continue
+            smi = str(row.get("smiles") or "").strip()
+            if not smi or not ligand_properties(smi):
+                smi = _canonical_smiles_from_mol(mol) or ""
+            if not smi or not ligand_properties(smi):
+                continue
+            if (generator_name, pocket_id, smi) not in allowed:
+                continue
+
+            pose_id = _pose_id_for(generator_name, pocket_id, csv_path.parent.name, filename, row_idx)
+            rows.append((
+                PoseRecord(
+                    pose_id=pose_id,
+                    smiles=smi,
+                    generator=generator_name,
+                    pocket_id=pocket_id,
+                    source_rank=int(row_idx) + 1,
+                    pose_sdf=str(sdf_path),
+                    source=str(csv_path),
+                ),
+                mol,
+            ))
+    return rows
+
+
+def _collect_diffsbdd_pose_records(
+    run_dir: Path,
+    generated_df: pd.DataFrame,
+    allowed: set[tuple[str, str, str]],
+) -> list[tuple[PoseRecord, Chem.Mol]]:
+    rows: list[tuple[PoseRecord, Chem.Mol]] = []
+    root = run_dir / "generator_outputs" / "diffsbdd"
+    if not root.exists():
+        return rows
+
+    for sdf_path in sorted(root.glob("*/diffsbdd_samples.sdf")):
+        pocket_id = sdf_path.parent.name
+        try:
+            supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        except Exception:
+            continue
+        for mol_idx, mol in enumerate(supplier):
+            if mol is None:
+                continue
+            smi = _canonical_smiles_from_mol(mol) or ""
+            if not smi or not ligand_properties(smi):
+                continue
+            if ("DiffSBDD", pocket_id, smi) not in allowed:
+                continue
+            pose_id = _pose_id_for("DiffSBDD", pocket_id, sdf_path, mol_idx)
+            rows.append((
+                PoseRecord(
+                    pose_id=pose_id,
+                    smiles=smi,
+                    generator="DiffSBDD",
+                    pocket_id=pocket_id,
+                    source_rank=mol_idx + 1,
+                    pose_sdf=str(sdf_path),
+                    source=str(sdf_path),
+                ),
+                mol,
+            ))
+    return rows
+
+
+def build_rtmscore_pose_batches(
+    run_dir: Path,
+    generated_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Path]]:
+    """Build one RTMScore SDF batch per pocket from saved generator 3D poses."""
+    allowed = _allowed_pose_keys(generated_df)
+    pose_mols: list[tuple[PoseRecord, Chem.Mol]] = []
+    pose_mols.extend(_collect_diffsbdd_pose_records(run_dir, generated_df, allowed))
+    pose_mols.extend(_collect_pocketxmol_pose_records(run_dir, generated_df, "PocketXMol", allowed))
+    pose_mols.extend(_collect_pocketxmol_pose_records(run_dir, generated_df, "PocketXMolAR", allowed))
+
+    seen: set[str] = set()
+    deduped: list[tuple[PoseRecord, Chem.Mol]] = []
+    for record, mol in pose_mols:
+        if record.pose_id in seen:
+            continue
+        seen.add(record.pose_id)
+        deduped.append((record, mol))
+
+    score_dir = run_dir / "rtmscore"
+    input_dir = score_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows: list[dict[str, Any]] = []
+    sdf_by_pocket: dict[str, Path] = {}
+    writers: dict[str, Chem.SDWriter] = {}
+    try:
+        for record, mol in deduped:
+            out_sdf = input_dir / f"{record.pocket_id}_poses.sdf"
+            if record.pocket_id not in writers:
+                writers[record.pocket_id] = Chem.SDWriter(str(out_sdf))
+                sdf_by_pocket[record.pocket_id] = out_sdf
+            out_mol = Chem.Mol(mol)
+            out_mol.SetProp("_Name", record.pose_id)
+            out_mol.SetProp("smiles", record.smiles)
+            out_mol.SetProp("generator", record.generator)
+            out_mol.SetProp("pocket_id", record.pocket_id)
+            writers[record.pocket_id].write(out_mol)
+            manifest_rows.append(dataclasses.asdict(record))
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+    manifest = pd.DataFrame(manifest_rows)
+    manifest_path = score_dir / "rtmscore_pose_manifest.csv"
+    manifest.to_csv(manifest_path, index=False)
+    return manifest, sdf_by_pocket
+
+
+class RTMScorePoseOracle:
+    """Pose-based RTMScore scorer for generated SDF conformations."""
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self.repo = cfg.paths.models_dir / "rtmscore"
+        self.python = env_python("rtmscore", cfg.paths)
+        self.script = self.repo / "example" / "rtmscore.py"
+        if not self.script.exists():
+            self.script = self.repo / "rtmscore.py"
+        self.model = self.repo / "trained_models" / cfg.rtmscore_model_name
+
+    def ready(self) -> bool:
+        return self.repo.exists() and self.python.exists() and self.script.exists() and self.model.exists()
+
+    def requirements(self) -> list[str]:
+        return [str(p) for p in (self.repo, self.python, self.script, self.model) if not p.exists()]
+
+    def _get_devices(self) -> list[str]:
+        if torch is not None and torch.cuda.is_available():
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            return devices if devices else ["cpu"]
+        return ["cpu"]
+
+    def _score_pocket(
+        self,
+        pocket_id: str,
+        pocket_pdb: Path,
+        ligands_sdf: Path,
+        out_prefix: Path,
+        device: str,
+    ) -> pd.DataFrame:
+        out_csv = out_prefix.with_suffix(".csv")
+        if out_csv.exists():
+            return pd.read_csv(out_csv)
+
+        env, _ = visible_gpu_env(device)
+        existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(self.repo) if not existing_pp else f"{self.repo}:{existing_pp}"
+        cmd = [
+            str(self.python), str(self.script),
+            "-p", str(pocket_pdb),
+            "-l", str(ligands_sdf),
+            "-m", str(self.model),
+            "-o", str(out_prefix),
+            "-c", str(self._cfg.rtmscore_cutoff_angstrom),
+        ]
+        if self._cfg.rtmscore_parallel_graphs:
+            cmd.append("-pl")
+        run_command(cmd, cwd=self.repo, env=env, stream=True, quiet=self._cfg.quiet)
+        if not out_csv.exists():
+            raise RuntimeError(f"RTMScore did not produce expected output: {out_csv}")
+        return pd.read_csv(out_csv)
+
+    def score(
+        self,
+        pose_manifest: pd.DataFrame,
+        ligand_sdfs: dict[str, Path],
+        pocket_specs: list[PocketSpec],
+        score_dir: Path,
+    ) -> pd.DataFrame:
+        if pose_manifest.empty:
+            return pd.DataFrame(columns=["pose_id", "rtmscore_score"])
+        if not self.ready():
+            missing = "\n  ".join(self.requirements())
+            raise RuntimeError(
+                "RTMScore is not installed/configured. Missing:\n  "
+                f"{missing}\n"
+                "Expected repo at models/rtmscore, env at envs/uv/rtmscore, "
+                "and trained model under models/rtmscore/trained_models/."
+            )
+
+        score_dir.mkdir(parents=True, exist_ok=True)
+        spec_by_pocket = {spec.pocket_id: spec for spec in pocket_specs}
+        devices = self._get_devices()
+        pending = [
+            pid for pid in sorted(ligand_sdfs)
+            if pid in spec_by_pocket and not (score_dir / f"{pid}_scores.csv").exists()
+        ]
+        cached = [
+            pid for pid in sorted(ligand_sdfs)
+            if pid in spec_by_pocket and (score_dir / f"{pid}_scores.csv").exists()
+        ]
+        cached_n = int(pose_manifest[pose_manifest["pocket_id"].isin(cached)].shape[0])
+        pending_n = int(pose_manifest[pose_manifest["pocket_id"].isin(pending)].shape[0])
+
+        print(
+            f"RTMScore scoring {pending_n} ligand poses across {len(devices)} GPU(s) "
+            f"({len(pending)} pocket batch(es)); {cached_n} cached",
+            flush=True,
+        )
+
+        progress_lock = threading.Lock()
+        with tqdm(
+            total=len(pose_manifest),
+            initial=cached_n,
+            desc="RTMScore scored poses",
+            unit="pose",
+            dynamic_ncols=True,
+        ) as bar:
+
+            def _run_one(task_idx: int, pocket_id: str) -> tuple[str, pd.DataFrame]:
+                spec = spec_by_pocket[pocket_id]
+                out_prefix = score_dir / f"{pocket_id}_scores"
+                df = self._score_pocket(
+                    pocket_id=pocket_id,
+                    pocket_pdb=spec.pocket_pdb,
+                    ligands_sdf=ligand_sdfs[pocket_id],
+                    out_prefix=out_prefix,
+                    device=devices[task_idx % len(devices)],
+                )
+                with progress_lock:
+                    n_rows = int(pose_manifest[pose_manifest["pocket_id"] == pocket_id].shape[0])
+                    bar.update(n_rows)
+                return pocket_id, df
+
+            if pending:
+                max_workers = min(len(devices), len(pending))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(_run_one, task_idx, pocket_id): pocket_id
+                        for task_idx, pocket_id in enumerate(pending)
+                    }
+                    for future in as_completed(futures):
+                        pocket_id = futures[future]
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            print(f"RTMScore {pocket_id} failed: {exc}", flush=True)
+
+        score_frames: list[pd.DataFrame] = []
+        for pocket_id in sorted(ligand_sdfs):
+            score_csv = score_dir / f"{pocket_id}_scores.csv"
+            if not score_csv.exists():
+                continue
+            frame = pd.read_csv(score_csv)
+            if "score" not in frame.columns:
+                continue
+            frame = frame.rename(columns={"score": "rtmscore_score"})
+            manifest_ids = pose_manifest.loc[
+                pose_manifest["pocket_id"] == pocket_id, "pose_id"
+            ].astype(str).tolist()
+            manifest_id_set = set(manifest_ids)
+            if "id" in frame.columns:
+                raw_ids = frame["id"].astype(str)
+                index_to_pose = {str(i): pose_id for i, pose_id in enumerate(manifest_ids)}
+                if set(raw_ids).issubset(manifest_id_set):
+                    frame["pose_id"] = raw_ids
+                elif set(raw_ids).issubset(index_to_pose):
+                    frame["pose_id"] = raw_ids.map(index_to_pose)
+                else:
+                    frame["pose_id"] = raw_ids
+            elif len(frame) == len(manifest_ids):
+                frame["pose_id"] = manifest_ids
+            else:
+                continue
+            frame["pocket_id"] = pocket_id
+            score_frames.append(frame[["pose_id", "pocket_id", "rtmscore_score"]])
+        if not score_frames:
+            return pd.DataFrame(columns=["pose_id", "pocket_id", "rtmscore_score"])
+        return pd.concat(score_frames, ignore_index=True)
+
+
+def aggregate_rtmscore_scores(
+    unique_df: pd.DataFrame,
+    pose_manifest: pd.DataFrame,
+    pose_scores: pd.DataFrame,
+) -> pd.DataFrame:
+    if pose_manifest.empty or pose_scores.empty:
+        merged = unique_df.copy()
+        merged["rank_score"] = 0.0
+        merged["rtmscore_score"] = np.nan
+        merged["rtmscore_n_poses"] = 0
+        return merged
+
+    scored_poses = pose_manifest.merge(pose_scores, on=["pose_id", "pocket_id"], how="inner")
+    scored_poses["rtmscore_score"] = pd.to_numeric(scored_poses["rtmscore_score"], errors="coerce")
+    scored_poses = scored_poses.dropna(subset=["rtmscore_score"])
+    if scored_poses.empty:
+        merged = unique_df.copy()
+        merged["rank_score"] = 0.0
+        merged["rtmscore_score"] = np.nan
+        merged["rtmscore_n_poses"] = 0
+        return merged
+
+    best_idx = scored_poses.groupby("smiles")["rtmscore_score"].idxmax()
+    best = scored_poses.loc[best_idx, [
+        "smiles", "pose_id", "generator", "pocket_id", "rtmscore_score",
+    ]].rename(columns={
+        "pose_id": "rtmscore_best_pose_id",
+        "generator": "rtmscore_best_generator",
+        "pocket_id": "rtmscore_best_pocket_id",
+    })
+    agg = scored_poses.groupby("smiles", sort=False).agg(
+        rtmscore_mean_score=("rtmscore_score", "mean"),
+        rtmscore_n_poses=("rtmscore_score", "count"),
+    ).reset_index()
+    agg = agg.merge(best, on="smiles", how="left")
+
+    merged = unique_df.merge(agg, on="smiles", how="left")
+    merged["rank_score"] = merged["rtmscore_score"].fillna(0.0)
+    merged["rtmscore_n_poses"] = merged["rtmscore_n_poses"].fillna(0).astype(int)
+    return merged
+
+
+def score_with_rtmscore(
+    generated_df: pd.DataFrame,
+    unique_df: pd.DataFrame,
+    pocket_specs: list[PocketSpec],
+    run_dir: Path,
+    cfg: Config,
+) -> pd.DataFrame:
+    pose_manifest, ligand_sdfs = build_rtmscore_pose_batches(run_dir, generated_df)
+    if pose_manifest.empty:
+        raise RuntimeError(
+            "No RTMScore-compatible pose SDFs were found. "
+            "RTMScore needs saved 3D ligand poses under generator_outputs/."
+        )
+
+    score_dir = run_dir / "rtmscore"
+    pose_scores_path = score_dir / "rtmscore_pose_scores.csv"
+    if pose_scores_path.exists():
+        print(f"\nRTMScore scoring: resuming from {pose_scores_path.name}", flush=True)
+        pose_scores = pd.read_csv(pose_scores_path)
+    else:
+        oracle = RTMScorePoseOracle(cfg)
+        pose_scores = oracle.score(
+            pose_manifest=pose_manifest,
+            ligand_sdfs=ligand_sdfs,
+            pocket_specs=pocket_specs,
+            score_dir=score_dir,
+        )
+        pose_scores.to_csv(pose_scores_path, index=False)
+
+    pose_level = pose_manifest.merge(pose_scores, on=["pose_id", "pocket_id"], how="left")
+    pose_level.to_csv(score_dir / "rtmscore_pose_level.csv", index=False)
+
+    merged = aggregate_rtmscore_scores(unique_df, pose_manifest, pose_scores)
+    merged["scorer"] = "rtmscore"
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1700,7 @@ def _save_ligand_space(
     unique_df: pd.DataFrame, palette: dict[str, str], cfg: Config, out_path: Path,
     generated_df: pd.DataFrame | None = None,
 ) -> None:
-    """Three-panel ligand space PCA: colored by generator, pocket, and Boltz score."""
+    """Three-panel ligand space PCA: colored by generator, pocket, and ranking score."""
     _ensure_plot_deps()
     if PCA is None:
         return
@@ -1259,14 +1767,14 @@ def _save_ligand_space(
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
         ax.legend(frameon=False, fontsize=8)
 
-    # Panel 3: colored by Boltz score (continuous colormap)
+    # Panel 3: colored by ranking score (continuous colormap)
     if has_score:
         ax = axes[panel]
         scores = embed_df["rank_score"].fillna(0).astype(float)
         sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7,
                         c=scores, cmap="RdYlGn", vmin=0, vmax=1)
-        plt.colorbar(sc, ax=ax, shrink=0.8, label="Boltz P(binding)")
-        ax.set_title("Colored by Boltz affinity score")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
+        ax.set_title("Colored by ranking score")
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
 
     fig.suptitle("Ligand chemical space (PCA on Morgan fingerprints)", fontsize=13)
@@ -1341,7 +1849,7 @@ def _save_scaffold_family_space(
     """
     PCA of molecules colored by scaffold family.
     Reveals whether the chemical space clusters align with scaffold families,
-    and which families are associated with high Boltz scores.
+    and which families are associated with high ranking scores.
     """
     _ensure_plot_deps()
     if PCA is None or clustered.empty:
@@ -1401,8 +1909,8 @@ def _save_scaffold_family_space(
         sizes = 10 + 40 * scores
         sc = ax2.scatter(embed_df["x"], embed_df["y"], s=sizes, alpha=0.6,
                          c=scores, cmap="RdYlGn", vmin=0, vmax=1)
-        plt.colorbar(sc, ax=ax2, shrink=0.8, label="Boltz P(binding)")
-        ax2.set_title("Scaffold families — sized & colored by Boltz score")
+        plt.colorbar(sc, ax=ax2, shrink=0.8, label="Ranking score")
+        ax2.set_title("Scaffold families sized and colored by score")
         ax2.set_xlabel("PC1"); ax2.set_ylabel("PC2")
 
     fig.suptitle("Chemical space colored by scaffold family", fontsize=13)
@@ -1417,9 +1925,9 @@ def _save_scaffold_family_pocket_heatmap(
     out_path: Path,
 ) -> None:
     """
-    Heatmap: scaffold family × pocket — mean Boltz score.
+    Heatmap: scaffold family × pocket — mean ranking score.
 
-    Each cell shows the mean Boltz P(binding) for molecules of that scaffold
+    Each cell shows the mean ranking score for molecules of that scaffold
     family when generated for that pocket. Reveals pocket-selective scaffold families.
     Also shows n_mols per cell as text annotation.
     """
@@ -1487,7 +1995,7 @@ def _save_scaffold_family_pocket_heatmap(
                 color = "black" if (np.isnan(val) or 0.3 < val < 0.7) else "white"
                 ax.text(j, i, txt, ha="center", va="center", fontsize=7, color=color)
 
-    label = "Mean Boltz P(binding)" if has_score else "Mean QED"
+    label = "Mean ranking score" if has_score else "Mean QED"
     ax.set_title(f"Scaffold family × pocket — {label}\n"
                  f"(families ordered by mean score, only non-singleton families shown)")
     fig.colorbar(im, ax=ax, shrink=0.6, label=label)
@@ -1822,20 +2330,43 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
     unique_df = build_unique_dataframe(generated_df)
     unique_df.to_csv(run_dir / "unique_generated.csv", index=False)
 
-    # Phase 2: Score all unique molecules with Boltz (no proxy pre-filter)
-    oracle = BoltzCliOracle(pocket_specs[0], cfg)
+    # Phase 2: Score molecules
     all_smiles = unique_df["smiles"].tolist()
-    scored_candidates_path = run_dir / "scored_candidates.csv"
+    scorer = cfg.scorer.strip().lower()
+    scored_candidates_path = (
+        run_dir / "scored_candidates.csv"
+        if scorer == "boltz"
+        else run_dir / f"scored_candidates_{scorer}.csv"
+    )
     if scored_candidates_path.exists():
-        print(f"\nBoltz scoring: resuming from {scored_candidates_path.name}", flush=True)
+        print(f"\n{scorer} scoring: resuming from {scored_candidates_path.name}", flush=True)
         merged = pd.read_csv(scored_candidates_path)
     else:
-        print(f"\nBoltz scoring {len(all_smiles)} unique molecules ...", flush=True)
-        annotations = oracle.score(all_smiles)
-        merged = unique_df.copy()
-        merged["rank_score"] = [a.get("rank_score") for a in annotations]
-        merged["affinity_probability_binary"] = [a.get("affinity_probability_binary") for a in annotations]
-        merged["affinity_pred_value"] = [a.get("affinity_pred_value") for a in annotations]
+        if scorer == "boltz":
+            oracle = BoltzCliOracle(pocket_specs[0], cfg)
+            print(f"\nBoltz scoring {len(all_smiles)} unique molecules ...", flush=True)
+            annotations = oracle.score(all_smiles)
+            merged = unique_df.copy()
+            merged["rank_score"] = [a.get("rank_score") for a in annotations]
+            merged["affinity_probability_binary"] = [a.get("affinity_probability_binary") for a in annotations]
+            merged["affinity_pred_value"] = [a.get("affinity_pred_value") for a in annotations]
+            merged["scorer"] = "boltz"
+        elif scorer == "rtmscore":
+            print(f"\nRTMScore scoring poses for {len(all_smiles)} unique molecules ...", flush=True)
+            merged = score_with_rtmscore(
+                generated_df=generated_df,
+                unique_df=unique_df,
+                pocket_specs=pocket_specs,
+                run_dir=run_dir,
+                cfg=cfg,
+            )
+        elif scorer in ("none", "skip"):
+            print("\nScoring skipped; ranking by QED only.", flush=True)
+            merged = unique_df.copy()
+            merged["rank_score"] = merged["qed"].fillna(0.0)
+            merged["scorer"] = "none"
+        else:
+            raise ValueError(f"Unknown scorer: {cfg.scorer!r}. Expected boltz, rtmscore, or none.")
         merged.to_csv(scored_candidates_path, index=False)
 
     # Top hits
@@ -1892,6 +2423,7 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
         "pocket_sources": [s.pocket_source for s in pocket_specs],
         "n_generated_rows": int(len(generated_df)),
         "n_unique_molecules": int(merged["smiles"].nunique()),
+        "scorer": scorer,
         "top_smiles": top_hits.iloc[0]["smiles"] if not top_hits.empty else None,
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))

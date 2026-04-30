@@ -40,6 +40,7 @@ RUN_NAME="${RUN_NAME:-}"
 QUIET="${QUIET:-true}"
 REFRESH="${REFRESH:-false}"
 GENERATORS="${GENERATORS:-}"
+SCORER="${SCORER:-boltz}"
 P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 POCKET_RADIUS="${POCKET_RADIUS:-10.0}"
@@ -55,6 +56,7 @@ echo "Mode:        $MODE"
 echo "Max pockets: $P2RANK_MAX_POCKETS"
 [[ -n "$RUN_NAME" ]] && echo "Run name:    $RUN_NAME"
 [[ -n "$GENERATORS" ]] && echo "Generators:  $GENERATORS"
+echo "Scorer:      $SCORER"
 [[ -n "$LIGAND_RESNAME" ]] && echo "Ligand:      $LIGAND_RESNAME"
 [[ -n "$ANCHOR_RESIDUE" ]] && echo "Anchor:      $ANCHOR_RESIDUE"
 [[ "$REFRESH" == "true" ]] && echo "Refresh:     YES"
@@ -112,6 +114,7 @@ cfg = Config(
     pdb_id="$PDB_ID",
     target_name="$TARGET_NAME",
     generator_mode="$MODE",
+    scorer="$SCORER",
     n_generate_per_model_per_pocket=$N_PER_POCKET,
     p2rank_max_pockets=int("$P2RANK_MAX_POCKETS"),
     p2rank_min_score=float("$P2RANK_MIN_SCORE"),
