@@ -742,27 +742,26 @@ class BoltzCliOracle:
     def _parse_result(self, predictions_dir: Path, stem: str) -> dict[str, float | None]:
         """Parse affinity result for a single YAML stem from a batch predictions dir."""
         candidate_dir = predictions_dir / stem
-        for pattern in ("affinity_*.json", "confidence_*.json"):
-            for candidate in candidate_dir.rglob(pattern) if candidate_dir.exists() else []:
-                data = json.loads(candidate.read_text())
-                affinity = data.get("affinity_pred_value")
-                prob = data.get("affinity_probability_binary")
-                rank = (
-                    float(prob) if prob is not None
-                    else (float(-affinity) if affinity is not None else 0.0)
-                )
-                return {
-                    "rank_score": rank,
-                    "affinity_probability_binary": float(prob) if prob is not None else None,
-                    "affinity_pred_value": float(affinity) if affinity is not None else None,
-                }
+        for candidate in candidate_dir.rglob("affinity_*.json") if candidate_dir.exists() else []:
+            data = json.loads(candidate.read_text())
+            affinity = data.get("affinity_pred_value")
+            prob = data.get("affinity_probability_binary")
+            rank = (
+                float(prob) if prob is not None
+                else (float(-affinity) if affinity is not None else 0.0)
+            )
+            return {
+                "rank_score": rank,
+                "affinity_probability_binary": float(prob) if prob is not None else None,
+                "affinity_pred_value": float(affinity) if affinity is not None else None,
+            }
         return {"rank_score": 0.0, "affinity_probability_binary": None, "affinity_pred_value": None}
 
     def _has_result_file(self, predictions_dir: Path, stem: str) -> bool:
         candidate_dir = predictions_dir / stem
         if not candidate_dir.exists():
             return False
-        return any(candidate_dir.rglob("affinity_*.json")) or any(candidate_dir.rglob("confidence_*.json"))
+        return any(candidate_dir.rglob("affinity_*.json"))
 
     def _parse_persistent_prediction(self, smiles: str) -> dict[str, float | None] | None:
         stem = self._stem_for_smiles(smiles)

@@ -14,6 +14,7 @@ MODE="${MODE:-real}"
 QUIET="${QUIET:-true}"
 REFRESH="${REFRESH:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+TARGETS_OVERRIDE="${TARGETS_OVERRIDE:-}"
 
 LOG_DIR="${CHORUS_DIR}/logs/${RUN_PREFIX}"
 mkdir -p "$LOG_DIR"
@@ -30,6 +31,10 @@ TARGETS=(
     # Optional swap-in if you want a protein-protein-interaction pocket:
     # "4HG7 MDM2"
 )
+
+if [[ -n "$TARGETS_OVERRIDE" ]]; then
+    IFS=';' read -r -a TARGETS <<< "$TARGETS_OVERRIDE"
+fi
 
 slugify() {
     printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/^_//; s/_$//'
@@ -79,6 +84,7 @@ echo "=== Chorus target panel ==="
 echo "Run prefix: ${RUN_PREFIX}"
 echo "Results:    ${CHORUS_DIR}/results"
 echo "Logs:       ${LOG_DIR}"
+echo "Targets:    ${#TARGETS[@]}"
 echo ""
 
 for target in "${TARGETS[@]}"; do
