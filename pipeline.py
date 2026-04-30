@@ -18,7 +18,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -737,11 +737,18 @@ class BoltzCliOracle:
                 }
         return {"rank_score": 0.0, "affinity_probability_binary": None, "affinity_pred_value": None}
 
+    def _has_result_file(self, predictions_dir: Path, stem: str) -> bool:
+        candidate_dir = predictions_dir / stem
+        if not candidate_dir.exists():
+            return False
+        return any(candidate_dir.rglob("affinity_*.json")) or any(candidate_dir.rglob("confidence_*.json"))
+
     def _score_chunk(
         self,
         chunk: list[tuple[int, str]],   # (original_index, smiles)
         device: str,
         work_dir: Path,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> list[tuple[int, str, dict[str, float | None]]]:
         """Score a chunk of molecules on one GPU by calling boltz predict once."""
         if self.binary is None:
@@ -763,29 +770,57 @@ class BoltzCliOracle:
         numba_cache_dir = self._cfg.paths.boltz_cache_dir / "numba"
         numba_cache_dir.mkdir(parents=True, exist_ok=True)
         env["NUMBA_CACHE_DIR"] = str(numba_cache_dir)
-        run_command(
-            [
-                str(self.python), str(self.binary), "predict", str(yaml_dir),
-                "--out_dir", str(out_dir),
-                "--cache", str(self._cfg.paths.boltz_cache_dir),
-                "--accelerator", "gpu",
-                "--devices", "1",
-                "--no_kernels",
-                "--num_workers", "2",
-                "--diffusion_samples_affinity", "1",   # fast: 1 sample per mol
-                "--sampling_steps_affinity", "100",    # fast: 100 steps (vs 200 default)
-            ],
-            env=env,
-            quiet=self._cfg.quiet,
-        )
-
         # boltz predict <dir> writes to out_dir/boltz_results_<dir.stem>/predictions/
         predictions_dir = out_dir / f"boltz_results_{yaml_dir.name}" / "predictions"
 
+        reported: set[str] = set()
+        stop_monitor = threading.Event()
+
+        def _monitor_results() -> None:
+            while not stop_monitor.is_set():
+                newly_done = [
+                    stem for stem in stem_map
+                    if stem not in reported and self._has_result_file(predictions_dir, stem)
+                ]
+                if newly_done:
+                    reported.update(newly_done)
+                    if progress_callback is not None:
+                        progress_callback(len(newly_done))
+                stop_monitor.wait(5.0)
+
+        monitor_thread = threading.Thread(target=_monitor_results, daemon=True)
+        if progress_callback is not None:
+            monitor_thread.start()
+
         results = []
-        for stem, (orig_idx, smi) in stem_map.items():
-            result = self._parse_result(predictions_dir, stem)
-            results.append((orig_idx, smi, result))
+        command_completed = False
+        try:
+            run_command(
+                [
+                    str(self.python), str(self.binary), "predict", str(yaml_dir),
+                    "--out_dir", str(out_dir),
+                    "--cache", str(self._cfg.paths.boltz_cache_dir),
+                    "--accelerator", "gpu",
+                    "--devices", "1",
+                    "--no_kernels",
+                    "--num_workers", "2",
+                    "--diffusion_samples_affinity", "1",   # fast: 1 sample per mol
+                    "--sampling_steps_affinity", "100",    # fast: 100 steps (vs 200 default)
+                ],
+                env=env,
+                quiet=self._cfg.quiet,
+            )
+            command_completed = True
+            for stem, (orig_idx, smi) in stem_map.items():
+                result = self._parse_result(predictions_dir, stem)
+                results.append((orig_idx, smi, result))
+        finally:
+            stop_monitor.set()
+            if progress_callback is not None:
+                monitor_thread.join(timeout=1.0)
+                remaining = len(stem_map) - len(reported)
+                if command_completed and remaining:
+                    progress_callback(remaining)
         return results
 
     def _get_devices(self) -> list[str]:
@@ -832,26 +867,49 @@ class BoltzCliOracle:
         with tempfile.TemporaryDirectory() as base_tmp:
             base = Path(base_tmp)
 
+            score_lock = threading.Lock()
+            progress_bar = tqdm(
+                total=len(smiles_list),
+                initial=len(smiles_list) - len(pending),
+                desc="Boltz scored ligands",
+                unit="ligand",
+                dynamic_ncols=True,
+            )
+
+            def _record_scored(delta: int) -> None:
+                if delta <= 0:
+                    return
+                with score_lock:
+                    progress_bar.update(delta)
+
             def _run_gpu(gpu_idx: int) -> list[tuple[int, str, dict]]:
                 chunk = chunks[gpu_idx]
                 if not chunk:
                     return []
                 work_dir = base / f"gpu_{gpu_idx}"
                 work_dir.mkdir()
-                return self._score_chunk(chunk, devices[gpu_idx], work_dir)
+                return self._score_chunk(
+                    chunk,
+                    devices[gpu_idx],
+                    work_dir,
+                    progress_callback=_record_scored,
+                )
 
-            with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-                gpu_futures = {executor.submit(_run_gpu, i): i for i in range(n_gpus)}
-                scored = 0
-                for future in as_completed(gpu_futures):
-                    gpu_idx = gpu_futures[future]
-                    try:
-                        for orig_idx, smi, result in future.result():
-                            results[orig_idx] = result
-                            self.cache[smi] = result
-                            scored += 1
-                    except Exception as exc:
-                        print(f"Boltz GPU {devices[gpu_idx]} chunk failed: {exc}", flush=True)
+            scored = 0
+            try:
+                with ThreadPoolExecutor(max_workers=n_gpus) as executor:
+                    gpu_futures = {executor.submit(_run_gpu, i): i for i in range(n_gpus)}
+                    for future in as_completed(gpu_futures):
+                        gpu_idx = gpu_futures[future]
+                        try:
+                            for orig_idx, smi, result in future.result():
+                                results[orig_idx] = result
+                                self.cache[smi] = result
+                                scored += 1
+                        except Exception as exc:
+                            print(f"Boltz GPU {devices[gpu_idx]} chunk failed: {exc}", flush=True)
+            finally:
+                progress_bar.close()
 
         print(f"Boltz scoring complete: {scored}/{len(pending)} succeeded.", flush=True)
         self.cache_path.write_text(json.dumps(self.cache, indent=2))
@@ -1669,26 +1727,36 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
                 ): spec.pocket_id
                 for spec, gen in pocket_generators
             }
-            for future in as_completed(futures):
-                pocket_id = futures[future]
-                completed += 1
-                try:
-                    gn, pid, smiles, elapsed = future.result()
-                    all_results[(gn, pid)] = smiles
-                    print(
-                        f"  {gn} @ {pid}: {len(smiles)} valid mols "
-                        f"({elapsed / 60:.1f} min) [{completed}/{total_tasks}]",
-                        flush=True,
-                    )
-                    if not smiles:
-                        generator_errors[f"{gn}:{pid}"] = "Zero valid molecules"
-                except Exception as exc:
-                    all_results[(gen_name, pocket_id)] = []
-                    generator_errors[f"{gen_name}:{pocket_id}"] = str(exc)
-                    print(
-                        f"  !!! {gen_name} @ {pocket_id}: {exc} [{completed}/{total_tasks}]",
-                        flush=True,
-                    )
+            valid_generated = 0
+            with tqdm(
+                total=n_pockets * cfg.n_generate_per_model_per_pocket,
+                desc=f"{gen_name} generated samples",
+                unit="mol",
+                dynamic_ncols=True,
+            ) as generation_bar:
+                for future in as_completed(futures):
+                    pocket_id = futures[future]
+                    completed += 1
+                    try:
+                        gn, pid, smiles, elapsed = future.result()
+                        all_results[(gn, pid)] = smiles
+                        valid_generated += len(smiles)
+                        generation_bar.update(cfg.n_generate_per_model_per_pocket)
+                        generation_bar.set_postfix(valid=valid_generated)
+                        tqdm.write(
+                            f"  {gn} @ {pid}: {len(smiles)} valid mols "
+                            f"({elapsed / 60:.1f} min) [{completed}/{total_tasks}]"
+                        )
+                        if not smiles:
+                            generator_errors[f"{gn}:{pid}"] = "Zero valid molecules"
+                    except Exception as exc:
+                        all_results[(gen_name, pocket_id)] = []
+                        generator_errors[f"{gen_name}:{pocket_id}"] = str(exc)
+                        generation_bar.update(cfg.n_generate_per_model_per_pocket)
+                        generation_bar.set_postfix(valid=valid_generated)
+                        tqdm.write(
+                            f"  !!! {gen_name} @ {pocket_id}: {exc} [{completed}/{total_tasks}]"
+                        )
 
         partial_df = build_generated_dataframe(
             {k: v for k, v in all_results.items() if k[0] == gen_name}
