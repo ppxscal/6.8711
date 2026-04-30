@@ -616,7 +616,7 @@ class BoltzCliOracle:
         self.scoring_run_dir = (
             cfg.paths.boltz_cache_dir
             / "scoring_runs"
-            / f"{self.target_cache_slug}_affinity_s100_d1"
+            / f"{self.target_cache_slug}_n{cfg.n_generate_per_model_per_pocket}_affinity_s100_d1"
         )
         self.msa_cache_path = (
             cfg.paths.msa_cache_dir
