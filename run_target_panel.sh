@@ -26,6 +26,7 @@ TARGETS=(
     "4CI2 CRBN"
     "3MXF BRD4_BD1"
     "5P9J BTK"
+    "8VF6 STK33"
     # Optional swap-in if you want a protein-protein-interaction pocket:
     # "4HG7 MDM2"
 )
