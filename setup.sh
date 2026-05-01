@@ -10,6 +10,7 @@ MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/models}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-$REPO_ROOT/checkpoints}"
 PY311="${PY311:-/usr/bin/python3.11}"
 PY310="${PY310:-/usr/bin/python3.10}"
+PY38="${PY38:-3.8}"
 FORCE="${FORCE:-false}"
 REFRESH_DOWNLOADS="${REFRESH_DOWNLOADS:-false}"
 export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-$CHORUS_DIR/cache/numba}"
@@ -24,6 +25,7 @@ CHORUS_PACKAGES=(
     "matplotlib"
     "rdkit>=2024.3.2"
     "scikit-learn>=1.4"
+    "umap-learn"
     "tqdm"
     "hdbscan"
     "seaborn"
@@ -31,6 +33,7 @@ CHORUS_PACKAGES=(
 BOLTZ_SPEC="${BOLTZ_SPEC:-boltz==2.2.1}"
 DIFFSBDD_REPO_URL="${DIFFSBDD_REPO_URL:-https://github.com/arneschneuing/DiffSBDD.git}"
 POCKETXMOL_REPO_URL="${POCKETXMOL_REPO_URL:-https://github.com/pengxingang/PocketXMol.git}"
+RTMSCORE_REPO_URL="${RTMSCORE_REPO_URL:-https://github.com/sc8668/RTMScore.git}"
 DIFFSBDD_CKPT_URL="${DIFFSBDD_CKPT_URL:-https://zenodo.org/record/8183747/files/crossdocked_fullatom_cond.ckpt?download=1}"
 POCKETXMOL_WEIGHTS_URL="${POCKETXMOL_WEIGHTS_URL:-https://zenodo.org/records/17801271/files/model_weights.tar.gz?download=1}"
 TORCH_CUDA="${TORCH_CUDA:-cu118}"
@@ -87,6 +90,30 @@ POCKETXMOL_PACKAGES=(
     "tensorboard"
     "setuptools<70"
 )
+RTMSCORE_TORCH_CUDA="${RTMSCORE_TORCH_CUDA:-cu111}"
+RTMSCORE_TORCH_VERSION="${RTMSCORE_TORCH_VERSION:-1.9.0}"
+RTMSCORE_TORCH_INDEX_URL="${RTMSCORE_TORCH_INDEX_URL:-https://download.pytorch.org/whl/$RTMSCORE_TORCH_CUDA}"
+RTMSCORE_DGL_SPEC="${RTMSCORE_DGL_SPEC:-dgl-cu111==0.6.1}"
+RTMSCORE_DGL_INDEX_URL="${RTMSCORE_DGL_INDEX_URL:-https://data.dgl.ai/wheels/repo.html}"
+RTMSCORE_PYG_FIND_LINKS="${RTMSCORE_PYG_FIND_LINKS:-https://data.pyg.org/whl/torch-${RTMSCORE_TORCH_VERSION}+${RTMSCORE_TORCH_CUDA}.html}"
+RTMSCORE_TORCH_SCATTER_SPEC="${RTMSCORE_TORCH_SCATTER_SPEC:-torch-scatter==2.0.8}"
+RTMSCORE_PACKAGES=(
+    "numpy==1.24.4"
+    "pandas==1.3.2"
+    "scipy==1.10.1"
+    "scikit-learn==0.24.2"
+    "seaborn==0.11.2"
+    "matplotlib==3.7.5"
+    "joblib==1.4.2"
+    "Cython<3"
+    "gsd==4.0.0"
+    "networkx==3.1"
+    "typing-extensions<4.6"
+    "MDAnalysis==2.0.0"
+    "ProDy==2.1.0"
+    "rdkit-pypi==2021.9.4"
+    "openbabel-wheel"
+)
 
 usage() {
     cat <<EOF
@@ -95,12 +122,13 @@ Usage: bash setup.sh [target]
 Targets:
   chorus          Build the lightweight orchestration/analysis env.
   boltz           Build the Boltz scoring env.
+  rtmscore        Build/download RTMScore repo, model, and env.
   models          Clone generator repos and download required checkpoints.
   diffsbdd        Build/download DiffSBDD repo, checkpoint, and env.
   pocketxmol      Build/download PocketXMol repo, weights, and env.
   generators      Build/download both generator stacks.
   check           Check envs and expected console scripts.
-  all             Build chorus + boltz + generators, then check.
+  all             Build chorus + boltz + rtmscore + generators, then check.
 
 Environment overrides:
   FORCE=true      Recreate the selected env from scratch.
@@ -111,6 +139,7 @@ Environment overrides:
   CHECKPOINTS_DIR=PATH Default: $CHECKPOINTS_DIR
   PY311=PATH      Default: $PY311
   PY310=PATH      Default: $PY310
+  PY38=SPEC       Default: $PY38
   TORCH_CUDA=TAG  Default: $TORCH_CUDA
   PYG_TORCH_TAG=TAG Default: $PYG_TORCH_TAG
   BOLTZ_SPEC=SPEC Default: $BOLTZ_SPEC
@@ -118,6 +147,7 @@ Environment overrides:
 Examples:
   bash setup.sh all
   bash setup.sh generators
+  bash setup.sh rtmscore
   FORCE=true bash setup.sh boltz
   BOLTZ_SPEC='boltz[cuda]==2.2.1' FORCE=true bash setup.sh boltz
 EOF
@@ -170,7 +200,9 @@ make_env() {
     env_py="$(env_python "$name")"
 
     require_uv
-    require_python "$py"
+    if [[ "$py" == */* ]]; then
+        require_python "$py"
+    fi
     mkdir -p "$ENV_ROOT"
 
     if [[ "$FORCE" == "true" && -e "$env_dir" ]]; then
@@ -278,6 +310,33 @@ ensure_diffsbdd_repo() {
 ensure_pocketxmol_repo() {
     clone_repo "$POCKETXMOL_REPO_URL" "$MODELS_DIR/pocketxmol"
     patch_pocketxmol_rdkit_six
+}
+
+ensure_rtmscore_repo() {
+    clone_repo "$RTMSCORE_REPO_URL" "$MODELS_DIR/rtmscore"
+    patch_rtmscore_num_workers
+}
+
+patch_rtmscore_num_workers() {
+    local script="$MODELS_DIR/rtmscore/example/rtmscore.py"
+    if [[ ! -f "$script" ]]; then
+        return 0
+    fi
+    if grep -q 'args\["num_workers"\] = 10' "$script"; then
+        echo "Patching RTMScore DataLoader workers: $script"
+        "$PY310" - "$script" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+text = text.replace(
+    'args["num_workers"] = 10',
+    'args["num_workers"] = int(os.environ.get("RTMSCORE_NUM_WORKERS", "0"))',
+)
+path.write_text(text)
+PY
+    fi
 }
 
 patch_pocketxmol_rdkit_six() {
@@ -443,6 +502,49 @@ setup_boltz() {
     echo "boltz env ok: $(env_script boltz boltz)"
 }
 
+setup_rtmscore() {
+    ensure_rtmscore_repo
+    make_env rtmscore "$PY38"
+    uv_install rtmscore --upgrade "pip<25" "setuptools<70" "wheel"
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python rtmscore)" \
+        --index-url "$RTMSCORE_TORCH_INDEX_URL" \
+        "torch==${RTMSCORE_TORCH_VERSION}+${RTMSCORE_TORCH_CUDA}"
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python rtmscore)" \
+        --find-links "$RTMSCORE_DGL_INDEX_URL" \
+        "$RTMSCORE_DGL_SPEC"
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python rtmscore)" \
+        --no-index \
+        --find-links "$RTMSCORE_PYG_FIND_LINKS" \
+        "$RTMSCORE_TORCH_SCATTER_SPEC"
+    uv_install rtmscore --upgrade "${RTMSCORE_PACKAGES[@]}"
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python rtmscore)" \
+        --reinstall \
+        --no-build-isolation \
+        "MDAnalysis==2.0.0"
+    "$(env_python rtmscore)" - <<'PY'
+import dgl
+import MDAnalysis
+import numpy
+import openbabel
+import pandas
+import prody
+import rdkit
+import sklearn
+import torch
+import torch_scatter
+print("rtmscore env ok", torch.__version__)
+PY
+    if [[ ! -s "$MODELS_DIR/rtmscore/trained_models/rtmscore_model1.pth" ]]; then
+        echo "Error: RTMScore trained model missing: $MODELS_DIR/rtmscore/trained_models/rtmscore_model1.pth" >&2
+        exit 1
+    fi
+    echo "rtmscore repo ok: $MODELS_DIR/rtmscore"
+}
+
 check_env() {
     local name="$1"
     local py
@@ -498,6 +600,8 @@ check_all() {
     check_imports chorus "import hdbscan, matplotlib, numpy, pandas, rdkit, sklearn" || status=1
     check_env boltz || status=1
     check_script boltz boltz || status=1
+    check_env rtmscore || status=1
+    check_imports rtmscore "import dgl, MDAnalysis, numpy, openbabel, pandas, prody, rdkit, sklearn, torch, torch_scatter" || status=1
     check_env diffsbdd || status=1
     check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import hdbscan, pytorch_lightning, rdkit, torch, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_env pocketxmol || status=1
@@ -507,6 +611,8 @@ check_all() {
     check_path "pocketxmol repo" "$MODELS_DIR/pocketxmol/scripts/sample_use.py" || status=1
     check_path "pocketxmol checkpoint" "$CHECKPOINTS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt" || status=1
     check_path "pocketxmol repo checkpoint link" "$MODELS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt" || status=1
+    check_path "rtmscore repo" "$MODELS_DIR/rtmscore/example/rtmscore.py" || status=1
+    check_path "rtmscore trained model" "$MODELS_DIR/rtmscore/trained_models/rtmscore_model1.pth" || status=1
 
     if [[ "$status" -eq 0 ]]; then
         echo "All checked envs are present."
@@ -523,6 +629,9 @@ case "$target" in
         ;;
     boltz)
         setup_boltz
+        ;;
+    rtmscore)
+        setup_rtmscore
         ;;
     models|assets)
         setup_models
@@ -542,6 +651,7 @@ case "$target" in
     all)
         setup_chorus
         setup_boltz
+        setup_rtmscore
         setup_generators
         check_all
         ;;

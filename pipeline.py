@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 from chorus.generators import (
     BasePocketGenerator, build_generators,
     get_scaffold, hash_smiles, ligand_properties,
-    fp_array, mol_from_smiles,
+    fp_array, mol_from_smiles, morgan_fp,
     env_binary, env_python, run_command, visible_gpu_env,
 )
 
@@ -47,7 +47,7 @@ try:
 except ImportError:
     PCA = None  # type: ignore[assignment]
 
-from rdkit import Chem
+from rdkit import Chem, DataStructs
 from rdkit.Chem import Draw
 
 
@@ -123,12 +123,17 @@ class Config:
     boltz_msa_pairing_strategy: str = "greedy"
     boltz_timeout_sec:          int = 600
 
-    scorer: str = "boltz"
+    scorer: str = "rtmscore"
     rtmscore_model_name: str = "rtmscore_model1.pth"
     rtmscore_cutoff_angstrom: float = 10.0
     rtmscore_parallel_graphs: bool = False
 
     max_pca_points: int = 5000
+    max_umap_points: int = 2000
+    max_cluster_points: int = 1000
+    ecfp_family_sim_threshold: float = 0.30
+    max_tanimoto_refs_per_pocket: int = 500
+    tanimoto_top_k: int = 10
     quiet:          bool = True
 
     paths: Paths = field(default_factory=lambda: Paths.from_root(_DEFAULT_ROOT))
@@ -383,6 +388,39 @@ def write_pocket_spec_json(spec: PocketSpec, out_path: Path) -> None:
         "p2rank_residues": spec.p2rank_residues,
     }
     out_path.write_text(json.dumps(payload, indent=2))
+
+
+def read_pocket_spec_json(path: Path) -> PocketSpec:
+    payload = json.loads(path.read_text())
+    return PocketSpec(
+        pocket_id=str(payload.get("pocket_id", path.stem)),
+        full_pdb=Path(payload.get("full_pdb", "")),
+        pocket_pdb=Path(payload.get("pocket_pdb", "")),
+        ligand_residue_id=str(payload.get("ligand_residue_id", "")),
+        ligand_resname=str(payload.get("ligand_resname", "")),
+        protein_chain=str(payload.get("protein_chain", "")),
+        protein_sequence=str(payload.get("protein_sequence", "")),
+        center=tuple(float(x) for x in payload.get("center", [0.0, 0.0, 0.0])),  # type: ignore[arg-type]
+        bbox_size=float(payload.get("bbox_size", 0.0)),
+        contact_residues=[str(x) for x in payload.get("contact_residues", [])],
+        pocket_source=str(payload.get("pocket_source", "cached")),
+        has_reference_ligand=bool(payload.get("has_reference_ligand", False)),
+        p2rank_score=float(payload.get("p2rank_score", 0.0)),
+        p2rank_residues=[str(x) for x in payload.get("p2rank_residues", [])],
+    )
+
+
+def read_cached_pocket_specs(run_dir: Path) -> list[PocketSpec]:
+    pocket_dir = run_dir / "pocket_specs"
+    if not pocket_dir.exists():
+        return []
+    specs = []
+    for path in sorted(pocket_dir.glob("*.json")):
+        try:
+            specs.append(read_pocket_spec_json(path))
+        except Exception as exc:
+            print(f"WARNING: could not read cached pocket spec {path.name}: {exc}", flush=True)
+    return specs
 
 
 def ensure_p2rank(cfg: Config) -> Path:
@@ -1265,6 +1303,7 @@ class RTMScorePoseOracle:
         env, _ = visible_gpu_env(device)
         existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.repo) if not existing_pp else f"{self.repo}:{existing_pp}"
+        env.setdefault("RTMSCORE_NUM_WORKERS", "0")
         cmd = [
             str(self.python), str(self.script),
             "-p", str(pocket_pdb),
@@ -1294,6 +1333,7 @@ class RTMScorePoseOracle:
             raise RuntimeError(
                 "RTMScore is not installed/configured. Missing:\n  "
                 f"{missing}\n"
+                "Run: bash setup.sh rtmscore\n"
                 "Expected repo at models/rtmscore, env at envs/uv/rtmscore, "
                 "and trained model under models/rtmscore/trained_models/."
             )
@@ -1371,9 +1411,12 @@ class RTMScorePoseOracle:
             manifest_id_set = set(manifest_ids)
             if "id" in frame.columns:
                 raw_ids = frame["id"].astype(str)
+                stripped_ids = raw_ids.str.replace(r"-\d+$", "", regex=True)
                 index_to_pose = {str(i): pose_id for i, pose_id in enumerate(manifest_ids)}
                 if set(raw_ids).issubset(manifest_id_set):
                     frame["pose_id"] = raw_ids
+                elif set(stripped_ids).issubset(manifest_id_set):
+                    frame["pose_id"] = stripped_ids
                 elif set(raw_ids).issubset(index_to_pose):
                     frame["pose_id"] = raw_ids.map(index_to_pose)
                 else:
@@ -1611,6 +1654,11 @@ def generate_all_figures(
     _save_ranked_hits(top_hits, out_dir / "ranked_top_hits.png")
     _save_ligand_space(unique_df, palette, cfg, out_dir / "ligand_space_pca.png",
                        generated_df=generated_df)
+    _save_ligand_space_umap(unique_df, palette, cfg, out_dir / "ligand_space_umap.png")
+    _save_source_pocket_ligand_space(
+        generated_df, unique_df, palette, cfg, out_dir / "source_pocket_ligand_space_pca.png"
+    )
+    _save_pocket_tanimoto_landscape(unique_df, cfg, out_dir / "pocket_tanimoto_landscape.png")
     _save_summary_dashboard(generated_df, unique_df, top_hits, pocket_specs, palette, cfg,
                             out_dir / "summary_dashboard.png")
     _save_pocket_generator_heatmap(generated_df, out_dir / "pocket_generator_heatmap.png")
@@ -1621,7 +1669,11 @@ def generate_all_figures(
     # Scaffold family analysis
     if not unique_df.empty and "scaffold" in unique_df.columns:
         try:
-            clustered = _cluster_scaffolds(unique_df)
+            clustered = _cluster_scaffolds(
+                unique_df,
+                max_points=cfg.max_cluster_points,
+                seed=cfg.seed,
+            )
             _save_scaffold_family_space(
                 clustered, cfg, out_dir / "scaffold_family_space.png"
             )
@@ -1700,7 +1752,7 @@ def _save_ligand_space(
     unique_df: pd.DataFrame, palette: dict[str, str], cfg: Config, out_path: Path,
     generated_df: pd.DataFrame | None = None,
 ) -> None:
-    """Three-panel ligand space PCA: colored by generator, pocket, and ranking score."""
+    """Aggregated unique-molecule PCA colored by generator, recurrence/best pocket, and score."""
     _ensure_plot_deps()
     if PCA is None:
         return
@@ -1735,9 +1787,10 @@ def _save_ligand_space(
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
-    has_pocket = "pocket_ids" in embed_df.columns
+    has_best_pocket = "rtmscore_best_pocket_id" in embed_df.columns
+    has_recurrence = "n_pockets" in embed_df.columns
 
-    n_panels = 1 + int(has_pocket) + int(has_score)
+    n_panels = 1 + int(has_best_pocket or has_recurrence) + int(has_score)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
     if n_panels == 1:
         axes = [axes]
@@ -1753,26 +1806,36 @@ def _save_ligand_space(
 
     panel = 1
 
-    # Panel 2: colored by primary pocket
-    if has_pocket:
+    # Panel 2: this is an aggregated unique-molecule view, so do not color by
+    # comma-joined source pockets. Use best-scoring pose pocket when available,
+    # otherwise show recurrence across source pockets as a continuous value.
+    if has_best_pocket:
         ax = axes[panel]; panel += 1
-        pocket_ids = sorted(embed_df["pocket_ids"].dropna().unique())
+        pocket_ids = sorted(embed_df["rtmscore_best_pocket_id"].dropna().unique())
         pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
         pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
         for pid in pocket_ids:
-            sub = embed_df[embed_df["pocket_ids"] == pid]
+            sub = embed_df[embed_df["rtmscore_best_pocket_id"] == pid]
             ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6,
                        color=pocket_palette[pid], label=pid)
-        ax.set_title("Colored by pocket")
+        ax.set_title("Best-scoring pose pocket")
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
         ax.legend(frameon=False, fontsize=8)
+    elif has_recurrence:
+        ax = axes[panel]; panel += 1
+        recurrence = pd.to_numeric(embed_df["n_pockets"], errors="coerce").fillna(1)
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7,
+                        c=recurrence, cmap="viridis")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Source pockets rediscovering SMILES")
+        ax.set_title("Rediscovery across source pockets")
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
 
     # Panel 3: colored by ranking score (continuous colormap)
     if has_score:
         ax = axes[panel]
         scores = embed_df["rank_score"].fillna(0).astype(float)
         sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7,
-                        c=scores, cmap="RdYlGn", vmin=0, vmax=1)
+                        c=scores, cmap="RdYlGn")
         plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
         ax.set_title("Colored by ranking score")
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
@@ -1783,11 +1846,331 @@ def _save_ligand_space(
     plt.close(fig)
 
 
+def _save_ligand_space_umap(
+    unique_df: pd.DataFrame, palette: dict[str, str], cfg: Config, out_path: Path,
+) -> None:
+    """Three-panel ligand space UMAP on Morgan fingerprints, if umap-learn is installed."""
+    _ensure_plot_deps()
+    try:
+        import umap  # type: ignore[import-not-found]
+    except ImportError:
+        print("WARNING: umap-learn is not installed; skipping ligand_space_umap.png", flush=True)
+        return
+
+    if unique_df.empty:
+        return
+
+    plot_df = unique_df.copy()
+    if len(plot_df) > cfg.max_umap_points:
+        plot_df = plot_df.sample(cfg.max_umap_points, random_state=cfg.seed)
+
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    print(f"Building ligand-space UMAP on {len(fps)} sampled molecules ...", flush=True)
+    reducer = umap.UMAP(
+        n_components=2,
+        metric="jaccard",
+        random_state=cfg.seed,
+        n_neighbors=30,
+        min_dist=0.1,
+    )
+    coords = reducer.fit_transform(np.stack(fps).astype(bool))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+
+    has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
+    has_pocket = "pocket_ids" in embed_df.columns
+    n_panels = 1 + int(has_pocket) + int(has_score)
+    fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
+    if n_panels == 1:
+        axes = [axes]
+
+    ax = axes[0]
+    for gen in sorted(embed_df["generators"].dropna().unique()):
+        sub = embed_df[embed_df["generators"] == gen]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, c=palette.get(gen, "#4E79A7"), label=gen)
+    ax.set_title("Colored by generator")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    ax.legend(frameon=False, fontsize=8)
+
+    panel = 1
+    if has_pocket:
+        ax = axes[panel]; panel += 1
+        pocket_ids = sorted(embed_df["pocket_ids"].dropna().unique())
+        pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
+        pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
+        for pid in pocket_ids:
+            sub = embed_df[embed_df["pocket_ids"] == pid]
+            ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, color=pocket_palette[pid], label=pid)
+        ax.set_title("Colored by pocket")
+        ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+        ax.legend(frameon=False, fontsize=8)
+
+    if has_score:
+        ax = axes[panel]
+        scores = embed_df["rank_score"].fillna(0).astype(float)
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7, c=scores, cmap="RdYlGn")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
+        ax.set_title("Colored by ranking score")
+        ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+
+    fig.suptitle("Ligand chemical space (UMAP on Morgan fingerprints)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _scored_source_dataframe(generated_df: pd.DataFrame, unique_df: pd.DataFrame) -> pd.DataFrame:
+    if generated_df.empty or unique_df.empty or "smiles" not in generated_df.columns:
+        return generated_df.copy()
+    score_cols = [
+        col for col in [
+            "smiles", "rank_score", "scorer", "rtmscore_score", "rtmscore_mean_score",
+            "rtmscore_best_pocket_id", "n_pockets", "n_generators",
+            "pocket_tanimoto_entropy", "pocket_tanimoto_z_entropy",
+            "pocket_tanimoto_z_specificity", "pocket_tanimoto_z_dominant_pocket",
+        ]
+        if col in unique_df.columns
+    ]
+    if len(score_cols) <= 1:
+        return generated_df.copy()
+    return generated_df.merge(unique_df[score_cols].drop_duplicates("smiles"), on="smiles", how="left")
+
+
+def _save_source_pocket_ligand_space(
+    generated_df: pd.DataFrame,
+    unique_df: pd.DataFrame,
+    palette: dict[str, str],
+    cfg: Config,
+    out_path: Path,
+) -> None:
+    """Source-conditioned PCA: one row per generator-pocket molecule, colored by true source pocket."""
+    _ensure_plot_deps()
+    if PCA is None or generated_df.empty:
+        return
+
+    source_df = _scored_source_dataframe(generated_df, unique_df)
+    plot_df = source_df.copy()
+    if len(plot_df) > cfg.max_pca_points:
+        plot_df = plot_df.sample(cfg.max_pca_points, random_state=cfg.seed)
+
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+    has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
+
+    fig, axes = plt.subplots(1, 3 if has_score else 2, figsize=(24 if has_score else 16, 7))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+
+    ax = axes[0]
+    for gen in sorted(embed_df["generator"].dropna().unique()):
+        sub = embed_df[embed_df["generator"] == gen]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.55, c=palette.get(gen, "#4E79A7"), label=gen)
+    ax.set_title("Source rows colored by generator")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1]
+    pocket_ids = sorted(embed_df["pocket_id"].dropna().unique())
+    pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
+    pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
+    for pid in pocket_ids:
+        sub = embed_df[embed_df["pocket_id"] == pid]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.62, color=pocket_palette[pid], label=pid)
+    ax.set_title("True conditioning pocket")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.legend(frameon=False, fontsize=8)
+
+    if has_score:
+        ax = axes[2]
+        scores = pd.to_numeric(embed_df["rank_score"], errors="coerce")
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.68, c=scores, cmap="RdYlGn")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
+        ax.set_title("Unique-molecule score projected onto source rows")
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+
+    fig.suptitle("Source-conditioned ligand chemical space (PCA on Morgan fingerprints)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_pocket_tanimoto_landscape(
+    unique_df: pd.DataFrame, cfg: Config, out_path: Path,
+) -> None:
+    """PCA landscape colored by pocket-neighborhood Tanimoto specificity."""
+    _ensure_plot_deps()
+    needed = {"smiles", "pocket_tanimoto_entropy", "pocket_tanimoto_dominant_pocket"}
+    if PCA is None or unique_df.empty or not needed.issubset(unique_df.columns):
+        return
+
+    plot_df = unique_df.copy()
+    if len(plot_df) > cfg.max_pca_points:
+        plot_df = plot_df.sample(cfg.max_pca_points, random_state=cfg.seed)
+
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+
+    ax = axes[0]
+    dominant_col = (
+        "pocket_tanimoto_z_dominant_pocket"
+        if "pocket_tanimoto_z_dominant_pocket" in embed_df.columns
+        else "pocket_tanimoto_dominant_pocket"
+    )
+    entropy_col = (
+        "pocket_tanimoto_z_entropy"
+        if "pocket_tanimoto_z_entropy" in embed_df.columns
+        else "pocket_tanimoto_entropy"
+    )
+    margin_col = (
+        "pocket_tanimoto_z_margin"
+        if "pocket_tanimoto_z_margin" in embed_df.columns
+        else "pocket_tanimoto_margin"
+    )
+
+    pockets = sorted(p for p in embed_df[dominant_col].dropna().unique() if str(p))
+    pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pockets), 1)))
+    pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pockets)}
+    for pid in pockets:
+        sub = embed_df[embed_df[dominant_col] == pid]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.62, color=pocket_palette[pid], label=pid)
+    ax.set_title("Nearest pocket chemical neighborhood")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1]
+    entropy = pd.to_numeric(embed_df[entropy_col], errors="coerce")
+    sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.72, c=entropy, cmap="viridis_r", vmin=0, vmax=1)
+    plt.colorbar(sc, ax=ax, shrink=0.8, label="Normalized Tanimoto entropy")
+    ax.set_title("Low normalized entropy = pocket-specific")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+
+    ax = axes[2]
+    margin = pd.to_numeric(embed_df.get(margin_col, 0.0), errors="coerce").fillna(0.0)
+    sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.72, c=margin, cmap="magma")
+    plt.colorbar(sc, ax=ax, shrink=0.8, label="Best minus second-best pocket score")
+    ax.set_title("Pocket-neighborhood specificity margin")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+
+    fig.suptitle("Pocket-specific chemical neighborhoods (Morgan fingerprint PCA)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_chemical_cluster_umap(
+    clustered: pd.DataFrame, cfg: Config, out_path: Path,
+) -> None:
+    """UMAP view of Morgan fingerprint chemical-space basins from HDBSCAN."""
+    _ensure_plot_deps()
+    try:
+        import umap  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    if clustered.empty or "chemical_cluster" not in clustered.columns:
+        return
+
+    plot_df = clustered.copy()
+    if len(plot_df) > cfg.max_umap_points:
+        plot_df = plot_df.sample(cfg.max_umap_points, random_state=cfg.seed)
+
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    print(f"Building chemical-cluster UMAP on {len(fps)} sampled molecules ...", flush=True)
+    coords = umap.UMAP(
+        n_components=2,
+        metric="jaccard",
+        random_state=cfg.seed,
+        n_neighbors=30,
+        min_dist=0.1,
+    ).fit_transform(np.stack(fps).astype(bool))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+
+    clusters = sorted(int(c) for c in embed_df["chemical_cluster"].dropna().unique())
+    real_clusters = [c for c in clusters if c != -1]
+    has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
+    fig, axes = plt.subplots(1, 1 + int(has_score), figsize=(9 * (1 + int(has_score)), 8))
+    if not has_score:
+        axes = [axes]
+
+    ax = axes[0]
+    noise = embed_df[embed_df["chemical_cluster"] == -1]
+    if not noise.empty:
+        ax.scatter(noise["x"], noise["y"], s=10, alpha=0.18, color="lightgrey", label=f"unclustered (n={len(noise)})")
+    cmap = plt.cm.tab20 if len(real_clusters) <= 20 else plt.cm.hsv
+    for i, cluster_id in enumerate(real_clusters):
+        sub = embed_df[embed_df["chemical_cluster"] == cluster_id]
+        ax.scatter(
+            sub["x"], sub["y"], s=22, alpha=0.75,
+            color=cmap(i / max(len(real_clusters), 1)),
+            label=f"C{cluster_id} (n={len(sub)})",
+        )
+    ax.set_title(f"Morgan fingerprint basins (HDBSCAN, {len(real_clusters)} clusters)")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    if len(real_clusters) <= 15:
+        ax.legend(frameon=False, fontsize=7, ncol=2)
+
+    if has_score:
+        ax2 = axes[1]
+        scores = embed_df["rank_score"].fillna(0).astype(float)
+        sc = ax2.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7, c=scores, cmap="RdYlGn")
+        plt.colorbar(sc, ax=ax2, shrink=0.8, label="Ranking score")
+        ax2.set_title("Basins colored by ranking score")
+        ax2.set_xlabel("UMAP1"); ax2.set_ylabel("UMAP2")
+
+    fig.suptitle("Chemical-space basins from Morgan fingerprints", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Scaffold family clustering + figures
 # ---------------------------------------------------------------------------
 
-def _cluster_scaffolds(unique_df: pd.DataFrame, min_cluster_size: int = 8) -> pd.DataFrame:
+def _cluster_scaffolds(
+    unique_df: pd.DataFrame,
+    min_cluster_size: int = 8,
+    max_points: int | None = None,
+    seed: int = 42,
+) -> pd.DataFrame:
     """
     Cluster molecules into scaffold families using HDBSCAN on scaffold Morgan FPs.
 
@@ -1802,7 +2185,17 @@ def _cluster_scaffolds(unique_df: pd.DataFrame, min_cluster_size: int = 8) -> pd
 
     scaffold_col = out["scaffold"].fillna("")
     # Build per-scaffold fingerprints (cluster scaffolds, propagate to molecules)
-    unique_scaffolds = [s for s in scaffold_col.unique() if s]
+    scaffold_counts = scaffold_col[scaffold_col != ""].value_counts()
+    unique_scaffolds = scaffold_counts.index.tolist()
+    if max_points is not None and len(unique_scaffolds) > max_points:
+        unique_scaffolds = unique_scaffolds[:max_points]
+        print(
+            f"Clustering scaffold families on {len(unique_scaffolds)}/"
+            f"{len(scaffold_counts)} most frequent scaffolds ...",
+            flush=True,
+        )
+    else:
+        print(f"Clustering scaffold families on {len(unique_scaffolds)} scaffolds ...", flush=True)
     if len(unique_scaffolds) < 2:
         return out
 
@@ -1827,6 +2220,617 @@ def _cluster_scaffolds(unique_df: pd.DataFrame, min_cluster_size: int = 8) -> pd
     scaffold_to_family = dict(zip(valid_scaffolds, labels.tolist()))
     out["scaffold_family"] = scaffold_col.map(scaffold_to_family).fillna(-1).astype(int)
     return out
+
+
+def _cluster_molecule_fingerprints(
+    unique_df: pd.DataFrame,
+    min_cluster_size: int = 25,
+    max_points: int | None = None,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Cluster molecules into Morgan fingerprint chemical-space basins."""
+    import hdbscan
+
+    out = unique_df.copy()
+    out["chemical_cluster"] = -1
+    if out.empty:
+        return out
+
+    cluster_df = out
+    if max_points is not None and len(cluster_df) > max_points:
+        cluster_df = cluster_df.sample(max_points, random_state=seed)
+        print(
+            f"Clustering Morgan fingerprints for presentation CSVs "
+            f"on {len(cluster_df)}/{len(out)} sampled molecules ...",
+            flush=True,
+        )
+    else:
+        print(
+            f"Clustering Morgan fingerprints for presentation CSVs "
+            f"on {len(cluster_df)} molecules ...",
+            flush=True,
+        )
+
+    fps, indices = [], []
+    for idx, row in cluster_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            indices.append(idx)
+    if len(fps) < max(2, min_cluster_size):
+        return out
+
+    X = np.stack(fps).astype(float)
+    if PCA is not None and len(fps) > 3:
+        n_components = min(50, X.shape[1], len(fps) - 1)
+        X_cluster = PCA(n_components=n_components, random_state=seed).fit_transform(X)
+        labels = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=2,
+            metric="euclidean",
+            cluster_selection_method="eom",
+        ).fit_predict(X_cluster)
+    else:
+        labels = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            metric="jaccard",
+            cluster_selection_method="eom",
+        ).fit_predict(X.astype(bool))
+    out.loc[indices, "chemical_cluster"] = labels.astype(int)
+    return out
+
+
+def _split_multi_value(value: Any) -> list[str]:
+    if pd.isna(value):
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _composition_string(values: pd.Series, limit: int = 4) -> str:
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    for value in values.dropna():
+        for part in _split_multi_value(value):
+            counts[part] += 1
+    return "; ".join(f"{key}:{count}" for key, count in counts.most_common(limit))
+
+
+def _write_cluster_summary(clustered: pd.DataFrame, out_path: Path) -> None:
+    if clustered.empty or "chemical_cluster" not in clustered.columns:
+        pd.DataFrame().to_csv(out_path, index=False)
+        return
+
+    rows = []
+    score_col = "rank_score" if "rank_score" in clustered.columns else None
+    for cluster_id, sub in clustered.groupby("chemical_cluster", sort=True):
+        if int(cluster_id) == -1:
+            continue
+        scaffold = ""
+        if "scaffold" in sub.columns and sub["scaffold"].notna().any():
+            modes = sub["scaffold"].dropna().astype(str)
+            scaffold = modes.mode().iloc[0] if not modes.empty else ""
+        row = {
+            "cluster_id": int(cluster_id),
+            "n_molecules": int(len(sub)),
+            "top_scaffold": scaffold,
+            "generator_composition": _composition_string(sub.get("generators", pd.Series(dtype=str))),
+            "pocket_composition": _composition_string(sub.get("pocket_ids", pd.Series(dtype=str))),
+            "mean_qed": float(sub["qed"].mean()) if "qed" in sub.columns else np.nan,
+            "mean_mw": float(sub["mw"].mean()) if "mw" in sub.columns else np.nan,
+            "mean_logp": float(sub["logp"].mean()) if "logp" in sub.columns else np.nan,
+        }
+        if score_col:
+            scores = pd.to_numeric(sub[score_col], errors="coerce")
+            row.update({
+                "mean_score": float(scores.mean()),
+                "median_score": float(scores.median()),
+                "max_score": float(scores.max()),
+            })
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        frame.to_csv(out_path, index=False)
+        return
+    frame.sort_values(
+        ["max_score", "mean_score", "n_molecules"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).to_csv(out_path, index=False)
+
+
+def _write_top_hit_enrichment(
+    df: pd.DataFrame,
+    label_col: str,
+    out_path: Path,
+    label_name: str,
+    score_col: str = "rank_score",
+) -> None:
+    if df.empty or label_col not in df.columns or score_col not in df.columns:
+        pd.DataFrame().to_csv(out_path, index=False)
+        return
+
+    records = []
+    base = df[["smiles", label_col, score_col]].copy()
+    base[score_col] = pd.to_numeric(base[score_col], errors="coerce").fillna(0.0)
+    exploded_rows = []
+    for _, row in base.iterrows():
+        if label_col == "chemical_cluster":
+            if pd.isna(row[label_col]):
+                labels = []
+            else:
+                labels = [str(int(row[label_col]))]
+        else:
+            labels = _split_multi_value(row[label_col])
+        for label in labels:
+            if label and label != "-1":
+                exploded_rows.append({"smiles": row["smiles"], label_name: label, score_col: row[score_col]})
+    exploded = pd.DataFrame(exploded_rows)
+    if exploded.empty:
+        pd.DataFrame().to_csv(out_path, index=False)
+        return
+
+    totals = exploded.groupby(label_name)["smiles"].nunique()
+    ranked = base.sort_values(score_col, ascending=False)
+    for frac in (0.01, 0.05, 0.10):
+        n_top = max(1, int(np.ceil(len(ranked) * frac)))
+        top_smiles = set(ranked.head(n_top)["smiles"])
+        top = exploded[exploded["smiles"].isin(top_smiles)]
+        top_counts = top.groupby(label_name)["smiles"].nunique()
+        for label, total in totals.items():
+            n_label_top = int(top_counts.get(label, 0))
+            records.append({
+                "top_fraction": frac,
+                label_name: label,
+                "n_top": n_label_top,
+                "n_total": int(total),
+                "fraction_of_top_hits": n_label_top / n_top,
+                "top_hit_rate_within_label": n_label_top / int(total) if total else 0.0,
+            })
+    pd.DataFrame(records).sort_values(
+        ["top_fraction", "n_top", "top_hit_rate_within_label"],
+        ascending=[True, False, False],
+    ).to_csv(out_path, index=False)
+
+
+def _mean_topk_tanimoto(query_fp: Any, ref_fps: list[Any], top_k: int) -> float:
+    if not ref_fps:
+        return 0.0
+    sims = np.asarray(DataStructs.BulkTanimotoSimilarity(query_fp, ref_fps), dtype=float)
+    if sims.size == 0:
+        return 0.0
+    k = max(1, min(int(top_k), sims.size))
+    if sims.size > k:
+        sims = np.partition(sims, -k)[-k:]
+    return float(np.mean(sims))
+
+
+def _write_pocket_tanimoto_analysis(
+    run_dir: Path,
+    generated_df: pd.DataFrame,
+    merged: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    out = merged.copy()
+    if out.empty or "smiles" not in out.columns or "pocket_id" not in generated_df.columns:
+        return out
+
+    pocket_refs: dict[str, list[Any]] = {}
+    for pocket_id, sub in generated_df.groupby("pocket_id", sort=True):
+        smiles = sub["smiles"].dropna().astype(str).drop_duplicates()
+        if cfg.max_tanimoto_refs_per_pocket and len(smiles) > cfg.max_tanimoto_refs_per_pocket:
+            smiles = smiles.sample(cfg.max_tanimoto_refs_per_pocket, random_state=cfg.seed)
+        fps = [fp for fp in (morgan_fp(smi) for smi in smiles) if fp is not None]
+        if fps:
+            pocket_refs[str(pocket_id)] = fps
+
+    pocket_ids = sorted(pocket_refs)
+    if len(pocket_ids) < 2:
+        return out
+
+    print(
+        "Computing pocket Tanimoto entropy "
+        f"({len(out)} molecules, {len(pocket_ids)} pockets, "
+        f"up to {cfg.max_tanimoto_refs_per_pocket} refs/pocket) ...",
+        flush=True,
+    )
+
+    sim_cols = {pid: f"tanimoto_to_{pid}" for pid in pocket_ids}
+    for col in sim_cols.values():
+        out[col] = np.nan
+    out["pocket_tanimoto_entropy"] = np.nan
+    out["pocket_tanimoto_specificity"] = np.nan
+    out["pocket_tanimoto_dominant_pocket"] = ""
+    out["pocket_tanimoto_max"] = np.nan
+    out["pocket_tanimoto_second"] = np.nan
+    out["pocket_tanimoto_margin"] = np.nan
+    out["pocket_tanimoto_z_entropy"] = np.nan
+    out["pocket_tanimoto_z_specificity"] = np.nan
+    out["pocket_tanimoto_z_dominant_pocket"] = ""
+    out["pocket_tanimoto_z_margin"] = np.nan
+
+    denom = np.log(len(pocket_ids))
+    eps = 1e-12
+    for idx, row in out.iterrows():
+        fp = morgan_fp(str(row["smiles"]))
+        if fp is None:
+            continue
+        sims = np.asarray([
+            _mean_topk_tanimoto(fp, pocket_refs[pid], cfg.tanimoto_top_k)
+            for pid in pocket_ids
+        ], dtype=float)
+        for pid, value in zip(pocket_ids, sims):
+            out.at[idx, sim_cols[pid]] = value
+        order = np.argsort(sims)[::-1]
+        best = float(sims[order[0]])
+        second = float(sims[order[1]]) if len(order) > 1 else 0.0
+        total = float(sims.sum())
+        if total > eps:
+            probs = sims / total
+            entropy = float(-(probs * np.log(probs + eps)).sum() / denom)
+        else:
+            entropy = np.nan
+        out.at[idx, "pocket_tanimoto_entropy"] = entropy
+        out.at[idx, "pocket_tanimoto_specificity"] = 1.0 - entropy if pd.notna(entropy) else np.nan
+        out.at[idx, "pocket_tanimoto_dominant_pocket"] = pocket_ids[int(order[0])]
+        out.at[idx, "pocket_tanimoto_max"] = best
+        out.at[idx, "pocket_tanimoto_second"] = second
+        out.at[idx, "pocket_tanimoto_margin"] = best - second
+
+    sim_frame = out[list(sim_cols.values())].apply(pd.to_numeric, errors="coerce")
+    means = sim_frame.mean(axis=0)
+    stds = sim_frame.std(axis=0).replace(0, np.nan)
+    z_frame = (sim_frame - means) / stds
+    z_frame = z_frame.fillna(0.0)
+    for idx, z_row in z_frame.iterrows():
+        z = z_row.to_numpy(dtype=float)
+        shifted = z - np.max(z)
+        weights = np.exp(shifted)
+        probs = weights / max(float(weights.sum()), eps)
+        order = np.argsort(z)[::-1]
+        entropy = float(-(probs * np.log(probs + eps)).sum() / denom)
+        best = float(z[order[0]])
+        second = float(z[order[1]]) if len(order) > 1 else 0.0
+        out.at[idx, "pocket_tanimoto_z_entropy"] = entropy
+        out.at[idx, "pocket_tanimoto_z_specificity"] = 1.0 - entropy
+        out.at[idx, "pocket_tanimoto_z_dominant_pocket"] = pocket_ids[int(order[0])]
+        out.at[idx, "pocket_tanimoto_z_margin"] = best - second
+
+    analysis_cols = [
+        "smiles", "generators", "pocket_ids", "rank_score",
+        "pocket_tanimoto_dominant_pocket", "pocket_tanimoto_entropy",
+        "pocket_tanimoto_specificity", "pocket_tanimoto_max",
+        "pocket_tanimoto_second", "pocket_tanimoto_margin",
+        "pocket_tanimoto_z_dominant_pocket", "pocket_tanimoto_z_entropy",
+        "pocket_tanimoto_z_specificity", "pocket_tanimoto_z_margin",
+        *sim_cols.values(),
+    ]
+    available_cols = [col for col in analysis_cols if col in out.columns]
+    out[available_cols].to_csv(run_dir / "pocket_tanimoto_entropy.csv", index=False)
+
+    source_rows = []
+    for _, row in out.iterrows():
+        for source_pocket in _split_multi_value(row.get("pocket_ids", "")):
+            source_rows.append({
+                "source_pocket": source_pocket,
+                "dominant_tanimoto_pocket": row.get("pocket_tanimoto_dominant_pocket", ""),
+                "rank_score": row.get("rank_score", np.nan),
+                "entropy": row.get("pocket_tanimoto_entropy", np.nan),
+                "specificity": row.get("pocket_tanimoto_specificity", np.nan),
+                "margin": row.get("pocket_tanimoto_margin", np.nan),
+                "z_dominant_tanimoto_pocket": row.get("pocket_tanimoto_z_dominant_pocket", ""),
+                "z_entropy": row.get("pocket_tanimoto_z_entropy", np.nan),
+                "z_specificity": row.get("pocket_tanimoto_z_specificity", np.nan),
+                "z_margin": row.get("pocket_tanimoto_z_margin", np.nan),
+            })
+    source_df = pd.DataFrame(source_rows)
+    if not source_df.empty:
+        summary_rows = []
+        for source_pocket, sub in source_df.groupby("source_pocket", sort=True):
+            match = sub["dominant_tanimoto_pocket"].astype(str) == str(source_pocket)
+            summary_rows.append({
+                "source_pocket": source_pocket,
+                "n_molecules": int(len(sub)),
+                "mean_entropy": float(pd.to_numeric(sub["entropy"], errors="coerce").mean()),
+                "mean_specificity": float(pd.to_numeric(sub["specificity"], errors="coerce").mean()),
+                "mean_margin": float(pd.to_numeric(sub["margin"], errors="coerce").mean()),
+                "mean_z_entropy": float(pd.to_numeric(sub["z_entropy"], errors="coerce").mean()),
+                "mean_z_specificity": float(pd.to_numeric(sub["z_specificity"], errors="coerce").mean()),
+                "mean_z_margin": float(pd.to_numeric(sub["z_margin"], errors="coerce").mean()),
+                "mean_rank_score": float(pd.to_numeric(sub["rank_score"], errors="coerce").mean()),
+                "fraction_nearest_to_own_pocket": float(match.mean()),
+                "z_fraction_nearest_to_own_pocket": float(
+                    (sub["z_dominant_tanimoto_pocket"].astype(str) == str(source_pocket)).mean()
+                ),
+                "dominant_pocket_composition": _composition_string(sub["dominant_tanimoto_pocket"]),
+                "z_dominant_pocket_composition": _composition_string(sub["z_dominant_tanimoto_pocket"]),
+            })
+        pd.DataFrame(summary_rows).to_csv(run_dir / "pocket_tanimoto_summary.csv", index=False)
+        pd.crosstab(
+            source_df["source_pocket"],
+            source_df["dominant_tanimoto_pocket"],
+        ).to_csv(run_dir / "pocket_tanimoto_confusion.csv")
+
+    return out
+
+
+def _compute_tanimoto_matrix(fps_a: list[Any], fps_b: list[Any]) -> np.ndarray:
+    if not fps_a or not fps_b:
+        return np.zeros((len(fps_a), len(fps_b)), dtype=float)
+    return np.asarray(
+        [DataStructs.BulkTanimotoSimilarity(fp, fps_b) for fp in fps_a],
+        dtype=float,
+    )
+
+
+def _write_pocket_distribution_metrics(run_dir: Path, generated_df: pd.DataFrame, cfg: Config) -> None:
+    if generated_df.empty or "pocket_id" not in generated_df.columns:
+        pd.DataFrame().to_csv(run_dir / "pocket_chemical_distribution_metrics.csv", index=False)
+        return
+
+    pocket_fps: dict[str, list[Any]] = {}
+    for pocket_id, sub in generated_df.groupby("pocket_id", sort=True):
+        smiles = sub["smiles"].dropna().astype(str).drop_duplicates()
+        if cfg.max_tanimoto_refs_per_pocket and len(smiles) > cfg.max_tanimoto_refs_per_pocket:
+            smiles = smiles.sample(cfg.max_tanimoto_refs_per_pocket, random_state=cfg.seed)
+        fps = [fp for fp in (morgan_fp(smi) for smi in smiles) if fp is not None]
+        if fps:
+            pocket_fps[str(pocket_id)] = fps
+
+    rows = []
+    for source, fps_a in pocket_fps.items():
+        for target, fps_b in pocket_fps.items():
+            sims = _compute_tanimoto_matrix(fps_a, fps_b)
+            if sims.size == 0:
+                continue
+            if source == target and sims.shape[0] == sims.shape[1]:
+                np.fill_diagonal(sims, np.nan)
+            nearest = np.nanmax(sims, axis=1)
+            rows.append({
+                "source_pocket": source,
+                "target_pocket": target,
+                "n_source": int(len(fps_a)),
+                "n_target": int(len(fps_b)),
+                "mean_nearest_tanimoto": float(np.nanmean(nearest)),
+                "median_nearest_tanimoto": float(np.nanmedian(nearest)),
+                "p90_nearest_tanimoto": float(np.nanpercentile(nearest, 90)),
+                "mean_pairwise_tanimoto": float(np.nanmean(sims)),
+            })
+    pd.DataFrame(rows).to_csv(run_dir / "pocket_chemical_distribution_metrics.csv", index=False)
+
+
+def _write_score_correlation_metrics(run_dir: Path, merged: pd.DataFrame) -> None:
+    if merged.empty or "rank_score" not in merged.columns:
+        pd.DataFrame().to_csv(run_dir / "score_correlation_metrics.csv", index=False)
+        return
+    candidates = [
+        "mw", "logp", "qed", "hbd", "hba", "rot_bonds", "rings",
+        "n_generators", "n_pockets", "source_min_rank",
+        "rtmscore_n_poses", "pocket_tanimoto_entropy",
+        "pocket_tanimoto_specificity", "pocket_tanimoto_margin",
+        "pocket_tanimoto_z_entropy", "pocket_tanimoto_z_specificity",
+        "pocket_tanimoto_z_margin",
+    ]
+    rows = []
+    score = pd.to_numeric(merged["rank_score"], errors="coerce")
+    for col in candidates:
+        if col not in merged.columns:
+            continue
+        values = pd.to_numeric(merged[col], errors="coerce")
+        valid = score.notna() & values.notna()
+        if int(valid.sum()) < 3:
+            continue
+        rows.append({
+            "feature": col,
+            "n": int(valid.sum()),
+            "pearson_r": float(score[valid].corr(values[valid], method="pearson")),
+            "spearman_r": float(score[valid].corr(values[valid], method="spearman")),
+        })
+    pd.DataFrame(rows).sort_values("spearman_r", key=lambda s: s.abs(), ascending=False).to_csv(
+        run_dir / "score_correlation_metrics.csv", index=False
+    )
+
+
+def _write_source_pocket_predictability(run_dir: Path, generated_df: pd.DataFrame, cfg: Config) -> None:
+    if generated_df.empty or generated_df["pocket_id"].nunique() < 2:
+        pd.DataFrame().to_csv(run_dir / "source_pocket_predictability.csv", index=False)
+        return
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import StratifiedKFold, cross_val_score
+    except Exception as exc:
+        print(f"WARNING: sklearn classifier unavailable; skipping source pocket predictability: {exc}", flush=True)
+        pd.DataFrame().to_csv(run_dir / "source_pocket_predictability.csv", index=False)
+        return
+
+    rows = []
+    groups: list[tuple[str, pd.DataFrame]] = [("all_generators", generated_df)]
+    groups.extend((str(gen), sub) for gen, sub in generated_df.groupby("generator", sort=True))
+    for label, sub in groups:
+        sub = sub.dropna(subset=["smiles", "pocket_id"]).copy()
+        if len(sub) > cfg.max_pca_points:
+            sub = sub.sample(cfg.max_pca_points, random_state=cfg.seed)
+        counts = sub["pocket_id"].value_counts()
+        if len(counts) < 2 or counts.min() < 3:
+            continue
+        fps, labels = [], []
+        for row in sub.itertuples(index=False):
+            arr = fp_array(str(row.smiles))
+            if arr is not None:
+                fps.append(arr)
+                labels.append(str(row.pocket_id))
+        if len(set(labels)) < 2 or len(fps) < 6:
+            continue
+        X = np.stack(fps)
+        y = np.asarray(labels)
+        min_class = min(np.unique(y, return_counts=True)[1])
+        n_splits = max(2, min(5, int(min_class)))
+        model = LogisticRegression(max_iter=1000, class_weight="balanced", n_jobs=1)
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
+        scores = cross_val_score(model, X, y, cv=cv, scoring="balanced_accuracy")
+        rng = np.random.default_rng(cfg.seed)
+        shuffled = y.copy()
+        rng.shuffle(shuffled)
+        null_scores = cross_val_score(model, X, shuffled, cv=cv, scoring="balanced_accuracy")
+        rows.append({
+            "subset": label,
+            "n": int(len(y)),
+            "n_pockets": int(len(set(y))),
+            "balanced_accuracy_mean": float(np.mean(scores)),
+            "balanced_accuracy_std": float(np.std(scores)),
+            "shuffled_balanced_accuracy_mean": float(np.mean(null_scores)),
+            "delta_vs_shuffled": float(np.mean(scores) - np.mean(null_scores)),
+        })
+    pd.DataFrame(rows).to_csv(run_dir / "source_pocket_predictability.csv", index=False)
+
+
+def _butina_ecfp_families(df: pd.DataFrame, cfg: Config, sim_threshold: float | None = None) -> pd.DataFrame:
+    from rdkit.ML.Cluster import Butina
+
+    out = df.copy()
+    out["ecfp_family"] = -1
+    if out.empty:
+        return out
+    sample = out
+    if len(sample) > cfg.max_cluster_points:
+        sample = sample.sample(cfg.max_cluster_points, random_state=cfg.seed)
+    fps, indices = [], []
+    for idx, row in sample.iterrows():
+        fp = morgan_fp(str(row["smiles"]))
+        if fp is not None:
+            fps.append(fp)
+            indices.append(idx)
+    if len(fps) < 2:
+        return out
+    distances = []
+    for i in range(1, len(fps)):
+        sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[:i])
+        distances.extend([1.0 - x for x in sims])
+    threshold = cfg.ecfp_family_sim_threshold if sim_threshold is None else sim_threshold
+    clusters = Butina.ClusterData(distances, len(fps), 1.0 - threshold, isDistData=True)
+    for family_id, cluster in enumerate(clusters):
+        for local_idx in cluster:
+            out.at[indices[int(local_idx)], "ecfp_family"] = int(family_id)
+    return out
+
+
+def _write_ecfp_family_outputs(run_dir: Path, merged: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    try:
+        families = _butina_ecfp_families(merged, cfg)
+        assigned = families[families["ecfp_family"] != -1].copy()
+        rows = []
+        for family_id, sub in assigned.groupby("ecfp_family", sort=True):
+            scaffold = ""
+            if "scaffold" in sub.columns:
+                scaffolds = sub["scaffold"].dropna().astype(str)
+                scaffold = scaffolds.mode().iloc[0] if not scaffolds.empty else ""
+            medoid = sub.sort_values("rank_score", ascending=False)["smiles"].iloc[0] if "rank_score" in sub else sub["smiles"].iloc[0]
+            rows.append({
+                "ecfp_family": int(family_id),
+                "n_molecules": int(len(sub)),
+                "representative_smiles": medoid,
+                "top_scaffold": scaffold,
+                "generator_composition": _composition_string(sub.get("generators", pd.Series(dtype=str))),
+                "pocket_composition": _composition_string(sub.get("pocket_ids", pd.Series(dtype=str))),
+                "mean_rank_score": float(pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce").mean()),
+                "max_rank_score": float(pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce").max()),
+                "mean_qed": float(pd.to_numeric(sub.get("qed", np.nan), errors="coerce").mean()),
+            })
+        pd.DataFrame(rows).sort_values(
+            ["n_molecules", "max_rank_score"], ascending=[False, False], na_position="last"
+        ).to_csv(run_dir / "ecfp_family_summary.csv", index=False)
+        families.to_csv(run_dir / "ecfp_family_assignments.csv", index=False)
+        return families
+    except Exception as exc:
+        print(f"WARNING: ECFP family analysis failed: {exc}", flush=True)
+        pd.DataFrame().to_csv(run_dir / "ecfp_family_summary.csv", index=False)
+        return merged.copy()
+
+
+def _save_ecfp_family_landscape(families: pd.DataFrame, cfg: Config, out_path: Path) -> None:
+    _ensure_plot_deps()
+    if PCA is None or families.empty or "ecfp_family" not in families.columns:
+        return
+    plot_df = families[families["ecfp_family"] != -1].copy()
+    if plot_df.empty:
+        return
+    if len(plot_df) > cfg.max_pca_points:
+        plot_df = plot_df.sample(cfg.max_pca_points, random_state=cfg.seed)
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+    families_sorted = sorted(int(f) for f in embed_df["ecfp_family"].unique())
+    top_families = set(
+        embed_df["ecfp_family"].value_counts().head(20).index.astype(int).tolist()
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    ax = axes[0]
+    cmap = plt.cm.tab20
+    for i, family_id in enumerate(families_sorted):
+        sub = embed_df[embed_df["ecfp_family"] == family_id]
+        color = cmap(i % 20)
+        alpha = 0.75 if family_id in top_families else 0.18
+        label = f"F{family_id} (n={len(sub)})" if family_id in top_families else None
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=alpha, color=color, label=label)
+    ax.set_title("ECFP/Tanimoto modular families")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    if len(top_families) <= 20:
+        ax.legend(frameon=False, fontsize=7, ncol=2)
+    ax = axes[1]
+    if "rank_score" in embed_df.columns:
+        scores = pd.to_numeric(embed_df["rank_score"], errors="coerce")
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.72, c=scores, cmap="RdYlGn")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
+    ax.set_title("ECFP families colored by score")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    fig.suptitle("Hierarchical ECFP chemical families (sampled Butina groups)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_ecfp_family_tree(run_dir: Path, out_path: Path) -> None:
+    _ensure_plot_deps()
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage
+        from scipy.spatial.distance import squareform
+    except Exception:
+        return
+    summary_path = run_dir / "ecfp_family_summary.csv"
+    if not summary_path.exists():
+        return
+    summary = pd.read_csv(summary_path)
+    if summary.empty or "representative_smiles" not in summary.columns:
+        return
+    top = summary.head(30).copy()
+    fps, labels = [], []
+    for row in top.itertuples(index=False):
+        fp = morgan_fp(str(row.representative_smiles))
+        if fp is not None:
+            fps.append(fp)
+            labels.append(f"F{int(row.ecfp_family)} n={int(row.n_molecules)}")
+    if len(fps) < 3:
+        return
+    sim = _compute_tanimoto_matrix(fps, fps)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+    condensed = squareform(dist, checks=False)
+    linked = linkage(condensed, method="average")
+    fig, ax = plt.subplots(figsize=(12, max(5, len(labels) * 0.28)))
+    dendrogram(linked, labels=labels, orientation="right", ax=ax, color_threshold=0.5)
+    ax.set_xlabel("1 - Tanimoto similarity")
+    ax.set_title("Hierarchy of top ECFP/Tanimoto families")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _scaffold_family_label(family_id: int, family_smiles: list[str]) -> str:
@@ -1905,10 +2909,11 @@ def _save_scaffold_family_space(
     if has_score:
         ax2 = axes[1]
         scores = embed_df["rank_score"].fillna(0).astype(float)
-        # Size proportional to score to highlight high-affinity regions
-        sizes = 10 + 40 * scores
+        span = scores.max() - scores.min()
+        normalized = (scores - scores.min()) / span if span > 0 else scores * 0
+        sizes = 10 + 40 * normalized
         sc = ax2.scatter(embed_df["x"], embed_df["y"], s=sizes, alpha=0.6,
-                         c=scores, cmap="RdYlGn", vmin=0, vmax=1)
+                         c=scores, cmap="RdYlGn")
         plt.colorbar(sc, ax=ax2, shrink=0.8, label="Ranking score")
         ax2.set_title("Scaffold families sized and colored by score")
         ax2.set_xlabel("PC1"); ax2.set_ylabel("PC2")
@@ -1969,8 +2974,10 @@ def _save_scaffold_family_pocket_heatmap(
 
     fig, ax = plt.subplots(figsize=(max(8, len(pivot_mean.columns) * 2),
                                     max(6, len(pivot_mean) * 0.5 + 2)))
-    im = ax.imshow(pivot_mean.values.astype(float), aspect="auto",
-                   cmap="RdYlGn", vmin=0, vmax=1)
+    if value_col == "qed":
+        im = ax.imshow(pivot_mean.values.astype(float), aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
+    else:
+        im = ax.imshow(pivot_mean.values.astype(float), aspect="auto", cmap="RdYlGn")
 
     ax.set_xticks(range(len(pivot_mean.columns)))
     ax.set_xticklabels(pivot_mean.columns, rotation=45, ha="right")
@@ -2203,6 +3210,143 @@ _WORKERS_PER_GPU: dict[str, int] = {
 }
 
 
+def _scored_candidates_path(run_dir: Path, scorer: str) -> Path:
+    return (
+        run_dir / "scored_candidates.csv"
+        if scorer == "boltz"
+        else run_dir / f"scored_candidates_{scorer}.csv"
+    )
+
+
+def _load_cached_run_tables(
+    run_dir: Path, scorer: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[PocketSpec]] | None:
+    generated_path = run_dir / "generated_by_generator.csv"
+    unique_path = run_dir / "unique_generated.csv"
+    scored_path = _scored_candidates_path(run_dir, scorer)
+    if not (generated_path.exists() and unique_path.exists() and scored_path.exists()):
+        return None
+
+    print(
+        f"\nCached run detected: loading {generated_path.name}, "
+        f"{unique_path.name}, and {scored_path.name}",
+        flush=True,
+    )
+    generated_df = pd.read_csv(generated_path)
+    unique_df = pd.read_csv(unique_path)
+    merged = pd.read_csv(scored_path)
+    pocket_specs = read_cached_pocket_specs(run_dir)
+    return generated_df, unique_df, merged, pocket_specs
+
+
+def _write_standard_analysis_csvs(run_dir: Path, generated_df: pd.DataFrame) -> None:
+    try:
+        build_scaffold_diversity_matrix(generated_df).to_csv(run_dir / "scaffold_diversity_matrix.csv")
+        pocket_sensitivity(generated_df).to_csv(run_dir / "generator_pocket_sensitivity.csv", header=True)
+        compute_budget_summary(generated_df).to_csv(run_dir / "compute_budget_summary.csv")
+        scaffold_df = generated_df[generated_df["scaffold"] != ""]
+        for pocket_id in scaffold_df["pocket_id"].unique():
+            pocket_jaccard_matrix(
+                scaffold_df[scaffold_df["pocket_id"] == pocket_id]
+            ).to_csv(run_dir / f"scaffold_jaccard_{pocket_id}.csv")
+    except Exception as exc:
+        print(f"WARNING: analysis step failed: {exc}", flush=True)
+
+    scaffold_df = generated_df.loc[generated_df["scaffold"] != ""]
+    if not scaffold_df.empty:
+        scaffold_df.groupby(["scaffold", "generator", "pocket_id"]).size().unstack(
+            fill_value=0
+        ).to_csv(run_dir / "scaffold_presence.csv")
+
+
+def _write_presentation_analysis_csvs(run_dir: Path, merged: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    try:
+        clustered = _cluster_molecule_fingerprints(
+            merged,
+            max_points=cfg.max_cluster_points,
+            seed=cfg.seed,
+        )
+        _write_cluster_summary(clustered, run_dir / "cluster_summary.csv")
+        _write_top_hit_enrichment(
+            clustered, "generators", run_dir / "top_hit_enrichment_by_generator.csv", "generator"
+        )
+        _write_top_hit_enrichment(
+            clustered, "pocket_ids", run_dir / "top_hit_enrichment_by_pocket.csv", "pocket"
+        )
+        _write_top_hit_enrichment(
+            clustered, "chemical_cluster", run_dir / "top_hit_enrichment_by_cluster.csv", "cluster"
+        )
+        return clustered
+    except Exception as exc:
+        print(f"WARNING: presentation analysis failed: {exc}", flush=True)
+        return merged.copy()
+
+
+def _finalize_analysis_outputs(
+    run_dir: Path,
+    run_name: str,
+    cfg: Config,
+    generated_df: pd.DataFrame,
+    merged: pd.DataFrame,
+    pocket_specs: list[PocketSpec],
+    generator_errors: dict[str, str],
+    scorer: str,
+) -> Path:
+    merged = _write_pocket_tanimoto_analysis(run_dir, generated_df, merged, cfg)
+    ranked = merged.copy()
+    ranked["_sort"] = pd.to_numeric(ranked.get("rank_score", 0.0), errors="coerce").fillna(0.0)
+    top_hits = (
+        ranked.sort_values(["_sort", "n_generators", "n_pockets", "qed"],
+                           ascending=[False, False, False, False])
+        .head(16).copy()
+    )
+    top_hits.to_csv(run_dir / "top_unique_hits.csv", index=False)
+
+    _write_standard_analysis_csvs(run_dir, generated_df)
+    _write_pocket_distribution_metrics(run_dir, generated_df, cfg)
+    _write_score_correlation_metrics(run_dir, merged)
+    _write_source_pocket_predictability(run_dir, generated_df, cfg)
+    clustered = _write_presentation_analysis_csvs(run_dir, merged, cfg)
+    ecfp_families = _write_ecfp_family_outputs(run_dir, merged, cfg)
+
+    figures_dir = run_dir / "figures"
+    if figures_dir.exists():
+        shutil.rmtree(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    palette = _build_palette(sorted(set(generated_df["generator"])))
+    generate_all_figures(
+        generated_df=generated_df,
+        unique_df=merged,
+        top_hits=top_hits,
+        pocket_specs=pocket_specs,
+        palette=palette,
+        cfg=cfg,
+        out_dir=figures_dir,
+    )
+    _save_chemical_cluster_umap(clustered, cfg, figures_dir / "chemical_cluster_umap.png")
+    _save_ecfp_family_landscape(ecfp_families, cfg, figures_dir / "ecfp_family_landscape.png")
+    _save_ecfp_family_tree(run_dir, figures_dir / "ecfp_family_tree.png")
+
+    summary = {
+        "run_dir": str(run_dir),
+        "run_name": run_name,
+        "pdb_id": cfg.pdb_id,
+        "target_name": cfg.target_name,
+        "generators": list(cfg.generators),
+        "generator_errors": generator_errors,
+        "n_pockets": len(pocket_specs),
+        "pocket_ids": [s.pocket_id for s in pocket_specs],
+        "pocket_sources": [s.pocket_source for s in pocket_specs],
+        "n_generated_rows": int(len(generated_df)),
+        "n_unique_molecules": int(merged["smiles"].nunique()) if "smiles" in merged.columns else int(len(merged)),
+        "scorer": scorer,
+        "top_smiles": top_hits.iloc[0]["smiles"] if not top_hits.empty else None,
+    }
+    (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
+    return run_dir
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -2212,6 +3356,22 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
     run_dir = cfg.paths.results_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     cfg.paths.makedirs()
+    scorer = cfg.scorer.strip().lower()
+
+    cached = _load_cached_run_tables(run_dir, scorer)
+    if cached is not None:
+        generated_df, unique_df, merged, pocket_specs = cached
+        print("Rebuilding analysis CSVs and figures from cached run outputs.", flush=True)
+        return _finalize_analysis_outputs(
+            run_dir=run_dir,
+            run_name=run_name,
+            cfg=cfg,
+            generated_df=generated_df,
+            merged=merged,
+            pocket_specs=pocket_specs,
+            generator_errors={},
+            scorer=scorer,
+        )
 
     # Phase 0: Detect pockets
     pocket_specs = prepare_target_pockets(cfg.pdb_id, cfg, anchor_residue=anchor_residue)
@@ -2332,12 +3492,7 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
 
     # Phase 2: Score molecules
     all_smiles = unique_df["smiles"].tolist()
-    scorer = cfg.scorer.strip().lower()
-    scored_candidates_path = (
-        run_dir / "scored_candidates.csv"
-        if scorer == "boltz"
-        else run_dir / f"scored_candidates_{scorer}.csv"
-    )
+    scored_candidates_path = _scored_candidates_path(run_dir, scorer)
     if scored_candidates_path.exists():
         print(f"\n{scorer} scoring: resuming from {scored_candidates_path.name}", flush=True)
         merged = pd.read_csv(scored_candidates_path)
@@ -2369,71 +3524,24 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
             raise ValueError(f"Unknown scorer: {cfg.scorer!r}. Expected boltz, rtmscore, or none.")
         merged.to_csv(scored_candidates_path, index=False)
 
-    # Top hits
-    ranked = merged.copy()
-    ranked["_sort"] = ranked["rank_score"].fillna(0.0)
-    top_hits = (
-        ranked.sort_values(["_sort", "n_generators", "n_pockets", "qed"],
-                           ascending=[False, False, False, False])
-        .head(16).copy()
-    )
-    top_hits.to_csv(run_dir / "top_unique_hits.csv", index=False)
-
-    # Analysis CSVs
-    try:
-        build_scaffold_diversity_matrix(generated_df).to_csv(run_dir / "scaffold_diversity_matrix.csv")
-        pocket_sensitivity(generated_df).to_csv(run_dir / "generator_pocket_sensitivity.csv", header=True)
-        compute_budget_summary(generated_df).to_csv(run_dir / "compute_budget_summary.csv")
-        scaffold_df = generated_df[generated_df["scaffold"] != ""]
-        for pocket_id in scaffold_df["pocket_id"].unique():
-            pocket_jaccard_matrix(
-                scaffold_df[scaffold_df["pocket_id"] == pocket_id]
-            ).to_csv(run_dir / f"scaffold_jaccard_{pocket_id}.csv")
-    except Exception as exc:
-        print(f"WARNING: analysis step failed: {exc}")
-
-    scaffold_df = generated_df.loc[generated_df["scaffold"] != ""]
-    if not scaffold_df.empty:
-        scaffold_df.groupby(["scaffold", "generator", "pocket_id"]).size().unstack(
-            fill_value=0
-        ).to_csv(run_dir / "scaffold_presence.csv")
-
-    # Figures
-    palette = _build_palette(sorted(set(generated_df["generator"])))
-    generate_all_figures(
-        generated_df=generated_df,
-        unique_df=merged,
-        top_hits=top_hits,
-        pocket_specs=pocket_specs,
-        palette=palette,
+    out = _finalize_analysis_outputs(
+        run_dir=run_dir,
+        run_name=run_name,
         cfg=cfg,
-        out_dir=run_dir / "figures",
+        generated_df=generated_df,
+        merged=merged,
+        pocket_specs=pocket_specs,
+        generator_errors=generator_errors,
+        scorer=scorer,
     )
-
-    # Summary
-    summary = {
-        "run_dir": str(run_dir),
-        "run_name": run_name,
-        "pdb_id": cfg.pdb_id,
-        "target_name": cfg.target_name,
-        "generators": list(cfg.generators),
-        "generator_errors": generator_errors,
-        "n_pockets": len(pocket_specs),
-        "pocket_ids": [s.pocket_id for s in pocket_specs],
-        "pocket_sources": [s.pocket_source for s in pocket_specs],
-        "n_generated_rows": int(len(generated_df)),
-        "n_unique_molecules": int(merged["smiles"].nunique()),
-        "scorer": scorer,
-        "top_smiles": top_hits.iloc[0]["smiles"] if not top_hits.empty else None,
-    }
-    (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"\nRun complete: {run_dir}")
     print(f"Pockets: {len(pocket_specs)}")
     print(f"Generated rows: {len(generated_df):,}")
     print(f"Unique molecules: {merged['smiles'].nunique():,}")
+    top_hits = pd.read_csv(run_dir / "top_unique_hits.csv") if (run_dir / "top_unique_hits.csv").exists() else pd.DataFrame()
     if not top_hits.empty:
         first = top_hits.iloc[0]
         score = first.get("rank_score") or 0.0
         print(f"Top hit: {first['smiles']} | generators={first['generators']} | score={score:.3f}")
-    return run_dir
+    return out

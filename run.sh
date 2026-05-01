@@ -40,7 +40,13 @@ RUN_NAME="${RUN_NAME:-}"
 QUIET="${QUIET:-true}"
 REFRESH="${REFRESH:-false}"
 GENERATORS="${GENERATORS:-}"
-SCORER="${SCORER:-boltz}"
+SCORER="${SCORER:-rtmscore}"
+MAX_PCA_POINTS="${MAX_PCA_POINTS:-5000}"
+MAX_UMAP_POINTS="${MAX_UMAP_POINTS:-2000}"
+MAX_CLUSTER_POINTS="${MAX_CLUSTER_POINTS:-1000}"
+ECFP_FAMILY_SIM_THRESHOLD="${ECFP_FAMILY_SIM_THRESHOLD:-0.30}"
+MAX_TANIMOTO_REFS_PER_POCKET="${MAX_TANIMOTO_REFS_PER_POCKET:-500}"
+TANIMOTO_TOP_K="${TANIMOTO_TOP_K:-10}"
 P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 POCKET_RADIUS="${POCKET_RADIUS:-10.0}"
@@ -57,6 +63,9 @@ echo "Max pockets: $P2RANK_MAX_POCKETS"
 [[ -n "$RUN_NAME" ]] && echo "Run name:    $RUN_NAME"
 [[ -n "$GENERATORS" ]] && echo "Generators:  $GENERATORS"
 echo "Scorer:      $SCORER"
+echo "Analysis cap: PCA=$MAX_PCA_POINTS UMAP=$MAX_UMAP_POINTS cluster=$MAX_CLUSTER_POINTS"
+echo "ECFP family: sim_threshold=$ECFP_FAMILY_SIM_THRESHOLD"
+echo "Tanimoto:    refs/pocket=$MAX_TANIMOTO_REFS_PER_POCKET top_k=$TANIMOTO_TOP_K"
 [[ -n "$LIGAND_RESNAME" ]] && echo "Ligand:      $LIGAND_RESNAME"
 [[ -n "$ANCHOR_RESIDUE" ]] && echo "Anchor:      $ANCHOR_RESIDUE"
 [[ "$REFRESH" == "true" ]] && echo "Refresh:     YES"
@@ -115,6 +124,12 @@ cfg = Config(
     target_name="$TARGET_NAME",
     generator_mode="$MODE",
     scorer="$SCORER",
+    max_pca_points=int("$MAX_PCA_POINTS"),
+    max_umap_points=int("$MAX_UMAP_POINTS"),
+    max_cluster_points=int("$MAX_CLUSTER_POINTS"),
+    ecfp_family_sim_threshold=float("$ECFP_FAMILY_SIM_THRESHOLD"),
+    max_tanimoto_refs_per_pocket=int("$MAX_TANIMOTO_REFS_PER_POCKET"),
+    tanimoto_top_k=int("$TANIMOTO_TOP_K"),
     n_generate_per_model_per_pocket=$N_PER_POCKET,
     p2rank_max_pockets=int("$P2RANK_MAX_POCKETS"),
     p2rank_min_score=float("$P2RANK_MIN_SCORE"),

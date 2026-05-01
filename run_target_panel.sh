@@ -15,6 +15,7 @@ QUIET="${QUIET:-true}"
 REFRESH="${REFRESH:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 TARGETS_OVERRIDE="${TARGETS_OVERRIDE:-}"
+SCORER="${SCORER:-rtmscore}"
 
 LOG_DIR="${CHORUS_DIR}/logs/${RUN_PREFIX}"
 mkdir -p "$LOG_DIR"
@@ -57,6 +58,7 @@ run_target() {
     echo "Generators: ${GENERATORS}"
     echo "Samples:    ${N_PER_POCKET} per generator-pocket"
     echo "Pockets:    top ${P2RANK_MAX_POCKETS} P2Rank pockets"
+    echo "Scorer:     ${SCORER}"
     echo "Log:        ${log_path}"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -76,6 +78,7 @@ run_target() {
         MODE="$MODE" \
         QUIET="$QUIET" \
         REFRESH="$REFRESH" \
+        SCORER="$SCORER" \
         bash "$CHORUS_DIR/run.sh"
     ) 2>&1 | tee "$log_path"
 }
