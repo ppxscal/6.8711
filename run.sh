@@ -10,19 +10,55 @@ CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-$REPO_ROOT/checkpoints}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$CHORUS_DIR/cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
+RUN_NAME="${RUN_NAME:-}"
+REFRESH="${REFRESH:-false}"
+SCORER="${SCORER:-rtmscore}"
+
+_scored_cache_name() {
+    local scorer
+    scorer="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$scorer" == "boltz" ]]; then
+        echo "scored_candidates.csv"
+    else
+        echo "scored_candidates_${scorer}.csv"
+    fi
+}
+
+_cached_analysis_ready() {
+    if [[ -z "$RUN_NAME" || "$REFRESH" == "true" ]]; then
+        return 1
+    fi
+    local run_dir="$CHORUS_DIR/results/$RUN_NAME"
+    local scored_name
+    scored_name="$(_scored_cache_name "$SCORER")"
+    [[ -f "$run_dir/generated_by_generator.csv" && \
+       -f "$run_dir/unique_generated.csv" && \
+       -f "$run_dir/$scored_name" ]]
+}
+
 _find_python() {
+    local imports="import hdbscan, rdkit, pandas, torch"
+    local purpose="full pipeline"
+    if _cached_analysis_ready; then
+        imports="import hdbscan, rdkit, pandas, matplotlib, sklearn, yaml"
+        purpose="cached analysis"
+    fi
     for candidate in \
         "$ENV_ROOT/chorus/bin/python" \
         "$ENV_ROOT/diffsbdd/bin/python" \
         "$REPO_ROOT/unicellular/.venv/bin/python" \
         "$(which python3 2>/dev/null)"; do
-        if [[ -x "$candidate" ]] && "$candidate" -c "import hdbscan, rdkit, pandas, torch" 2>/dev/null; then
+        if [[ -x "$candidate" ]] && "$candidate" -c "$imports" 2>/dev/null; then
             echo "$candidate"
             return 0
         fi
     done
-    echo "Error: could not find a Python with hdbscan, rdkit, pandas, and torch installed." >&2
-    echo "Run: bash setup.sh diffsbdd" >&2
+    echo "Error: could not find a Python for $purpose with required packages." >&2
+    if _cached_analysis_ready; then
+        echo "Run: bash setup.sh chorus" >&2
+    else
+        echo "Run: bash setup.sh diffsbdd" >&2
+    fi
     return 1
 }
 PYTHON="$(_find_python)"
@@ -36,13 +72,9 @@ fi
 TARGET_NAME="${TARGET_NAME:-$PDB_ID}"
 N_PER_POCKET="${N_PER_POCKET:-1250}"   # 2 gens × 4 pockets × 1250 = 10k total
 MODE="${MODE:-real}"
-RUN_NAME="${RUN_NAME:-}"
 QUIET="${QUIET:-true}"
-REFRESH="${REFRESH:-false}"
 GENERATORS="${GENERATORS:-}"
-SCORER="${SCORER:-rtmscore}"
 MAX_PCA_POINTS="${MAX_PCA_POINTS:-5000}"
-MAX_UMAP_POINTS="${MAX_UMAP_POINTS:-1000}"
 MAX_CLUSTER_POINTS="${MAX_CLUSTER_POINTS:-1000}"
 ECFP_FAMILY_SIM_THRESHOLD="${ECFP_FAMILY_SIM_THRESHOLD:-0.30}"
 MAX_TANIMOTO_REFS_PER_POCKET="${MAX_TANIMOTO_REFS_PER_POCKET:-500}"
@@ -63,7 +95,7 @@ echo "Max pockets: $P2RANK_MAX_POCKETS"
 [[ -n "$RUN_NAME" ]] && echo "Run name:    $RUN_NAME"
 [[ -n "$GENERATORS" ]] && echo "Generators:  $GENERATORS"
 echo "Scorer:      $SCORER"
-echo "Analysis cap: PCA=$MAX_PCA_POINTS UMAP=$MAX_UMAP_POINTS cluster=$MAX_CLUSTER_POINTS"
+echo "Analysis cap: PCA=$MAX_PCA_POINTS cluster=$MAX_CLUSTER_POINTS"
 echo "ECFP family: sim_threshold=$ECFP_FAMILY_SIM_THRESHOLD"
 echo "Tanimoto:    refs/pocket=$MAX_TANIMOTO_REFS_PER_POCKET top_k=$TANIMOTO_TOP_K"
 [[ -n "$LIGAND_RESNAME" ]] && echo "Ligand:      $LIGAND_RESNAME"
@@ -125,7 +157,6 @@ cfg = Config(
     generator_mode="$MODE",
     scorer="$SCORER",
     max_pca_points=int("$MAX_PCA_POINTS"),
-    max_umap_points=int("$MAX_UMAP_POINTS"),
     max_cluster_points=int("$MAX_CLUSTER_POINTS"),
     ecfp_family_sim_threshold=float("$ECFP_FAMILY_SIM_THRESHOLD"),
     max_tanimoto_refs_per_pocket=int("$MAX_TANIMOTO_REFS_PER_POCKET"),

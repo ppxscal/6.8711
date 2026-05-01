@@ -8,6 +8,7 @@ UV="${UV:-$(command -v uv || true)}"
 ENV_ROOT="${ENV_ROOT:-$REPO_ROOT/envs/uv}"
 MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/models}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-$REPO_ROOT/checkpoints}"
+TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/tools}"
 CACHE_ROOT="${CACHE_ROOT:-$REPO_ROOT/cache}"
 PY311="${PY311:-/usr/bin/python3.11}"
 PY310="${PY310:-/usr/bin/python3.10}"
@@ -28,15 +29,16 @@ CHORUS_PACKAGES=(
     "matplotlib"
     "rdkit>=2024.3.2"
     "scikit-learn>=1.4"
-    "umap-learn"
     "tqdm"
     "hdbscan"
     "seaborn"
+    "PyYAML"
 )
 BOLTZ_SPEC="${BOLTZ_SPEC:-boltz==2.2.1}"
 DIFFSBDD_REPO_URL="${DIFFSBDD_REPO_URL:-https://github.com/arneschneuing/DiffSBDD.git}"
 POCKETXMOL_REPO_URL="${POCKETXMOL_REPO_URL:-https://github.com/pengxingang/PocketXMol.git}"
 RTMSCORE_REPO_URL="${RTMSCORE_REPO_URL:-https://github.com/sc8668/RTMScore.git}"
+RASCORE_REPO_URL="${RASCORE_REPO_URL:-https://github.com/reymond-group/RAscore.git}"
 DIFFSBDD_CKPT_URL="${DIFFSBDD_CKPT_URL:-https://zenodo.org/record/8183747/files/crossdocked_fullatom_cond.ckpt?download=1}"
 POCKETXMOL_WEIGHTS_URL="${POCKETXMOL_WEIGHTS_URL:-https://zenodo.org/records/17801271/files/model_weights.tar.gz?download=1}"
 TORCH_CUDA="${TORCH_CUDA:-cu118}"
@@ -117,6 +119,13 @@ RTMSCORE_PACKAGES=(
     "rdkit-pypi==2021.9.4"
     "openbabel-wheel"
 )
+RASCORE_PACKAGES=(
+    "numpy<1.24"
+    "pandas==1.3.5"
+    "rdkit-pypi==2021.9.4"
+    "scikit-learn==0.22.1"
+    "xgboost==1.0.2"
+)
 
 usage() {
     cat <<EOF
@@ -126,12 +135,13 @@ Targets:
   chorus          Build the lightweight orchestration/analysis env.
   boltz           Build the Boltz scoring env.
   rtmscore        Build/download RTMScore repo, model, and env.
+  rascore         Build/download Reymond-group RAscore env for RA score analysis.
   models          Clone generator repos and download required checkpoints.
   diffsbdd        Build/download DiffSBDD repo, checkpoint, and env.
   pocketxmol      Build/download PocketXMol repo, weights, and env.
   generators      Build/download both generator stacks.
   check           Check envs and expected console scripts.
-  all             Build chorus + boltz + rtmscore + generators, then check.
+  all             Build chorus + boltz + rtmscore + rascore + generators, then check.
 
 Environment overrides:
   FORCE=true      Recreate the selected env from scratch.
@@ -151,6 +161,7 @@ Examples:
   bash setup.sh all
   bash setup.sh generators
   bash setup.sh rtmscore
+  bash setup.sh rascore
   FORCE=true bash setup.sh boltz
   BOLTZ_SPEC='boltz[cuda]==2.2.1' FORCE=true bash setup.sh boltz
 EOF
@@ -320,6 +331,10 @@ ensure_rtmscore_repo() {
     patch_rtmscore_num_workers
 }
 
+ensure_rascore_repo() {
+    clone_repo "$RASCORE_REPO_URL" "$TOOLS_DIR/RAscore"
+}
+
 patch_rtmscore_num_workers() {
     local script="$MODELS_DIR/rtmscore/example/rtmscore.py"
     if [[ ! -f "$script" ]]; then
@@ -436,6 +451,7 @@ import numpy
 import pandas
 import rdkit
 import sklearn
+import yaml
 print("chorus env ok")
 PY
 }
@@ -548,6 +564,33 @@ PY
     echo "rtmscore repo ok: $MODELS_DIR/rtmscore"
 }
 
+setup_rascore() {
+    ensure_rascore_repo
+    make_env rascore "$PY38"
+    if [[ "$FORCE" != "true" ]] && "$(env_python rascore)" - <<'PY' >/dev/null 2>&1
+from RAscore import RAscore_XGB
+scorer = RAscore_XGB.RAScorerXGB()
+score = float(scorer.predict("CCO"))
+assert 0.0 <= score <= 1.0
+PY
+    then
+        echo "Using existing RAscore env: $(env_python rascore)"
+        return 0
+    fi
+    uv_install rascore --upgrade "pip<25" "setuptools<70" "wheel"
+    uv_install rascore --upgrade "${RASCORE_PACKAGES[@]}"
+    UV_LINK_MODE=copy "$UV" pip install \
+        --python "$(env_python rascore)" \
+        --no-deps \
+        --editable "$TOOLS_DIR/RAscore"
+    uv_install rascore --upgrade "pandas==1.3.5"
+    "$(env_python rascore)" - <<'PY'
+from RAscore import RAscore_XGB
+scorer = RAscore_XGB.RAScorerXGB()
+print("rascore env ok")
+PY
+}
+
 check_env() {
     local name="$1"
     local py
@@ -605,6 +648,8 @@ check_all() {
     check_script boltz boltz || status=1
     check_env rtmscore || status=1
     check_imports rtmscore "import dgl, MDAnalysis, numpy, openbabel, pandas, prody, rdkit, sklearn, torch, torch_scatter" || status=1
+    check_env rascore || status=1
+    check_imports rascore "from RAscore import RAscore_XGB; scorer = RAscore_XGB.RAScorerXGB(); assert 0.0 <= float(scorer.predict('CCO')) <= 1.0" || status=1
     check_env diffsbdd || status=1
     check_imports diffsbdd "from openbabel import openbabel; from Bio.PDB.Polypeptide import three_to_one; import hdbscan, pytorch_lightning, rdkit, torch, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_env pocketxmol || status=1
@@ -616,6 +661,7 @@ check_all() {
     check_path "pocketxmol repo checkpoint link" "$MODELS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt" || status=1
     check_path "rtmscore repo" "$MODELS_DIR/rtmscore/example/rtmscore.py" || status=1
     check_path "rtmscore trained model" "$MODELS_DIR/rtmscore/trained_models/rtmscore_model1.pth" || status=1
+    check_path "rascore repo" "$TOOLS_DIR/RAscore/setup.py" || status=1
 
     if [[ "$status" -eq 0 ]]; then
         echo "All checked envs are present."
@@ -636,6 +682,9 @@ case "$target" in
     rtmscore)
         setup_rtmscore
         ;;
+    rascore)
+        setup_rascore
+        ;;
     models|assets)
         setup_models
         ;;
@@ -655,6 +704,7 @@ case "$target" in
         setup_chorus
         setup_boltz
         setup_rtmscore
+        setup_rascore
         setup_generators
         check_all
         ;;

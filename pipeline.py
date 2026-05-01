@@ -1652,14 +1652,8 @@ def generate_all_figures(
 
     _save_top_hits_grid(top_hits, out_dir / "top_hits_grid.png")
     _save_ranked_hits(top_hits, out_dir / "ranked_top_hits.png")
-    _save_ligand_space(unique_df, palette, cfg, out_dir / "ligand_space_pca.png",
-                       generated_df=generated_df)
-    _save_ligand_space_umap(unique_df, palette, cfg, out_dir / "ligand_space_umap.png")
     _save_source_pocket_ligand_space(
         generated_df, unique_df, palette, cfg, out_dir / "source_pocket_ligand_space_pca.png"
-    )
-    _save_source_pocket_ligand_space_umap(
-        generated_df, unique_df, palette, cfg, out_dir / "source_pocket_ligand_space_umap.png"
     )
     _save_pocket_tanimoto_landscape(unique_df, cfg, out_dir / "pocket_tanimoto_landscape.png")
     _save_summary_dashboard(generated_df, unique_df, top_hits, pocket_specs, palette, cfg,
@@ -2793,7 +2787,7 @@ def _write_source_pocket_predictability(run_dir: Path, generated_df: pd.DataFram
         y = np.asarray(labels)
         min_class = min(np.unique(y, return_counts=True)[1])
         n_splits = max(2, min(5, int(min_class)))
-        model = LogisticRegression(max_iter=1000, class_weight="balanced", n_jobs=1)
+        model = LogisticRegression(max_iter=1000, class_weight="balanced")
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
         scores = cross_val_score(model, X, y, cv=cv, scoring="balanced_accuracy")
         rng = np.random.default_rng(cfg.seed)
