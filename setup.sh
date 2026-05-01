@@ -109,7 +109,7 @@ RTMSCORE_PACKAGES=(
     "matplotlib==3.7.5"
     "joblib==1.4.2"
     "Cython<3"
-    "gsd==4.0.0"
+    "gsd==2.4.2"
     "networkx==3.1"
     "typing-extensions<4.6"
     "MDAnalysis==2.0.0"
