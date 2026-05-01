@@ -3057,7 +3057,10 @@ def _save_ecfp_family_tree(run_dir: Path, out_path: Path) -> None:
     summary_path = run_dir / "ecfp_family_summary.csv"
     if not summary_path.exists():
         return
-    summary = pd.read_csv(summary_path)
+    try:
+        summary = pd.read_csv(summary_path)
+    except pd.errors.EmptyDataError:
+        return
     if summary.empty or "representative_smiles" not in summary.columns:
         return
     top = summary.head(30).copy()
@@ -3094,7 +3097,10 @@ def _save_score_summary_plot(
     _ensure_plot_deps()
     if not summary_csv.exists():
         return
-    df = pd.read_csv(summary_csv)
+    try:
+        df = pd.read_csv(summary_csv)
+    except pd.errors.EmptyDataError:
+        return
     if df.empty:
         return
     if "mean_score" not in df.columns and "mean_rank_score" in df.columns:
