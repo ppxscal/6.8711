@@ -129,7 +129,7 @@ class Config:
     rtmscore_parallel_graphs: bool = False
 
     max_pca_points: int = 5000
-    max_umap_points: int = 2000
+    max_umap_points: int = 1000
     max_cluster_points: int = 1000
     ecfp_family_sim_threshold: float = 0.30
     max_tanimoto_refs_per_pocket: int = 500
@@ -1658,6 +1658,9 @@ def generate_all_figures(
     _save_source_pocket_ligand_space(
         generated_df, unique_df, palette, cfg, out_dir / "source_pocket_ligand_space_pca.png"
     )
+    _save_source_pocket_ligand_space_umap(
+        generated_df, unique_df, palette, cfg, out_dir / "source_pocket_ligand_space_umap.png"
+    )
     _save_pocket_tanimoto_landscape(unique_df, cfg, out_dir / "pocket_tanimoto_landscape.png")
     _save_summary_dashboard(generated_df, unique_df, top_hits, pocket_specs, palette, cfg,
                             out_dir / "summary_dashboard.png")
@@ -1886,8 +1889,9 @@ def _save_ligand_space_umap(
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
-    has_pocket = "pocket_ids" in embed_df.columns
-    n_panels = 1 + int(has_pocket) + int(has_score)
+    has_best_pocket = "rtmscore_best_pocket_id" in embed_df.columns
+    has_recurrence = "n_pockets" in embed_df.columns
+    n_panels = 1 + int(has_best_pocket or has_recurrence) + int(has_score)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
     if n_panels == 1:
         axes = [axes]
@@ -1901,17 +1905,24 @@ def _save_ligand_space_umap(
     ax.legend(frameon=False, fontsize=8)
 
     panel = 1
-    if has_pocket:
+    if has_best_pocket:
         ax = axes[panel]; panel += 1
-        pocket_ids = sorted(embed_df["pocket_ids"].dropna().unique())
+        pocket_ids = sorted(embed_df["rtmscore_best_pocket_id"].dropna().unique())
         pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
         pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
         for pid in pocket_ids:
-            sub = embed_df[embed_df["pocket_ids"] == pid]
+            sub = embed_df[embed_df["rtmscore_best_pocket_id"] == pid]
             ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, color=pocket_palette[pid], label=pid)
-        ax.set_title("Colored by pocket")
+        ax.set_title("Best-scoring pose pocket")
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
         ax.legend(frameon=False, fontsize=8)
+    elif has_recurrence:
+        ax = axes[panel]; panel += 1
+        recurrence = pd.to_numeric(embed_df["n_pockets"], errors="coerce").fillna(1)
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7, c=recurrence, cmap="viridis")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Source pockets rediscovering SMILES")
+        ax.set_title("Rediscovery across source pockets")
+        ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
 
     if has_score:
         ax = axes[panel]
@@ -2007,6 +2018,84 @@ def _save_source_pocket_ligand_space(
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
 
     fig.suptitle("Source-conditioned ligand chemical space (PCA on Morgan fingerprints)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_source_pocket_ligand_space_umap(
+    generated_df: pd.DataFrame,
+    unique_df: pd.DataFrame,
+    palette: dict[str, str],
+    cfg: Config,
+    out_path: Path,
+) -> None:
+    _ensure_plot_deps()
+    try:
+        import umap  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    if generated_df.empty:
+        return
+
+    source_df = _scored_source_dataframe(generated_df, unique_df)
+    plot_df = source_df.copy()
+    if len(plot_df) > cfg.max_umap_points:
+        plot_df = plot_df.sample(cfg.max_umap_points, random_state=cfg.seed)
+
+    fps, keep_rows = [], []
+    for _, row in plot_df.iterrows():
+        arr = fp_array(row["smiles"])
+        if arr is not None:
+            fps.append(arr)
+            keep_rows.append(row)
+    if len(fps) < 3:
+        return
+
+    embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
+    print(f"Building source-pocket UMAP on {len(fps)} sampled source rows ...", flush=True)
+    coords = umap.UMAP(
+        n_components=2,
+        metric="jaccard",
+        random_state=cfg.seed,
+        n_neighbors=30,
+        min_dist=0.1,
+    ).fit_transform(np.stack(fps).astype(bool))
+    embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+    has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
+
+    fig, axes = plt.subplots(1, 3 if has_score else 2, figsize=(24 if has_score else 16, 7))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+
+    ax = axes[0]
+    for gen in sorted(embed_df["generator"].dropna().unique()):
+        sub = embed_df[embed_df["generator"] == gen]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.58, c=palette.get(gen, "#4E79A7"), label=gen)
+    ax.set_title("Source rows colored by generator")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1]
+    pocket_ids = sorted(embed_df["pocket_id"].dropna().unique())
+    pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
+    pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
+    for pid in pocket_ids:
+        sub = embed_df[embed_df["pocket_id"] == pid]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.65, color=pocket_palette[pid], label=pid)
+    ax.set_title("True conditioning pocket")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    ax.legend(frameon=False, fontsize=8)
+
+    if has_score:
+        ax = axes[2]
+        scores = pd.to_numeric(embed_df["rank_score"], errors="coerce")
+        sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.7, c=scores, cmap="RdYlGn")
+        plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
+        ax.set_title("Unique-molecule score projected onto source rows")
+        ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+
+    fig.suptitle("Source-conditioned ligand chemical space (UMAP on Morgan fingerprints)", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -2337,6 +2426,46 @@ def _write_cluster_summary(clustered: pd.DataFrame, out_path: Path) -> None:
         ascending=[False, False, False],
         na_position="last",
     ).to_csv(out_path, index=False)
+
+
+def _write_scaffold_family_summary(run_dir: Path, merged: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    try:
+        clustered = _cluster_scaffolds(
+            merged,
+            max_points=cfg.max_cluster_points,
+            seed=cfg.seed,
+        )
+        rows = []
+        assigned = clustered[clustered["scaffold_family"] != -1].copy()
+        for family_id, sub in assigned.groupby("scaffold_family", sort=True):
+            scaffolds = sub["scaffold"].dropna().astype(str) if "scaffold" in sub.columns else pd.Series(dtype=str)
+            top_scaffold = scaffolds.mode().iloc[0] if not scaffolds.empty else ""
+            scores = pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce")
+            rows.append({
+                "scaffold_family": int(family_id),
+                "n_molecules": int(len(sub)),
+                "n_scaffolds": int(scaffolds.nunique()) if not scaffolds.empty else 0,
+                "top_scaffold": top_scaffold,
+                "generator_composition": _composition_string(sub.get("generators", pd.Series(dtype=str))),
+                "pocket_composition": _composition_string(sub.get("pocket_ids", pd.Series(dtype=str))),
+                "mean_score": float(scores.mean()),
+                "median_score": float(scores.median()),
+                "max_score": float(scores.max()),
+                "mean_qed": float(pd.to_numeric(sub.get("qed", np.nan), errors="coerce").mean()),
+            })
+        frame = pd.DataFrame(rows)
+        if not frame.empty:
+            frame = frame.sort_values(
+                ["max_score", "mean_score", "n_molecules"],
+                ascending=[False, False, False],
+                na_position="last",
+            )
+        frame.to_csv(run_dir / "scaffold_family_summary.csv", index=False)
+        return clustered
+    except Exception as exc:
+        print(f"WARNING: scaffold family summary failed: {exc}", flush=True)
+        pd.DataFrame().to_csv(run_dir / "scaffold_family_summary.csv", index=False)
+        return merged.copy()
 
 
 def _write_top_hit_enrichment(
@@ -2736,15 +2865,106 @@ def _write_ecfp_family_outputs(run_dir: Path, merged: pd.DataFrame, cfg: Config)
                 "max_rank_score": float(pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce").max()),
                 "mean_qed": float(pd.to_numeric(sub.get("qed", np.nan), errors="coerce").mean()),
             })
-        pd.DataFrame(rows).sort_values(
+        summary = pd.DataFrame(rows).sort_values(
             ["n_molecules", "max_rank_score"], ascending=[False, False], na_position="last"
-        ).to_csv(run_dir / "ecfp_family_summary.csv", index=False)
+        )
+        families, summary = _assign_ecfp_hierarchical_groups(families, summary)
+        summary.to_csv(run_dir / "ecfp_family_summary.csv", index=False)
+        _write_ecfp_group_summary(run_dir, families, summary)
         families.to_csv(run_dir / "ecfp_family_assignments.csv", index=False)
         return families
     except Exception as exc:
         print(f"WARNING: ECFP family analysis failed: {exc}", flush=True)
         pd.DataFrame().to_csv(run_dir / "ecfp_family_summary.csv", index=False)
         return merged.copy()
+
+
+def _assign_ecfp_hierarchical_groups(
+    families: pd.DataFrame,
+    summary: pd.DataFrame,
+    max_groups: int = 10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    families = families.copy()
+    summary = summary.copy()
+    families["ecfp_group"] = -1
+    summary["ecfp_group"] = -1
+    if summary.empty or "representative_smiles" not in summary.columns:
+        return families, summary
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except Exception:
+        for i, family_id in enumerate(summary["ecfp_family"].astype(int).tolist()):
+            group_id = i % max_groups
+            summary.loc[summary["ecfp_family"].astype(int) == family_id, "ecfp_group"] = group_id
+            families.loc[families["ecfp_family"].astype(int) == family_id, "ecfp_group"] = group_id
+        return families, summary
+
+    fps, family_ids = [], []
+    for row in summary.itertuples(index=False):
+        fp = morgan_fp(str(row.representative_smiles))
+        if fp is not None:
+            fps.append(fp)
+            family_ids.append(int(row.ecfp_family))
+    if len(fps) < 2:
+        if family_ids:
+            families.loc[families["ecfp_family"].isin(family_ids), "ecfp_group"] = 0
+            summary.loc[summary["ecfp_family"].isin(family_ids), "ecfp_group"] = 0
+        return families, summary
+
+    sim = _compute_tanimoto_matrix(fps, fps)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+    linked = linkage(squareform(dist, checks=False), method="average")
+    n_groups = max(2, min(max_groups, len(family_ids)))
+    raw_groups = fcluster(linked, t=n_groups, criterion="maxclust")
+
+    # Stable group ids by the best-scoring/largest family in each group.
+    group_members: dict[int, list[int]] = {}
+    for family_id, raw_group in zip(family_ids, raw_groups):
+        group_members.setdefault(int(raw_group), []).append(family_id)
+    group_order = sorted(
+        group_members,
+        key=lambda gid: (
+            -int(summary.loc[summary["ecfp_family"].isin(group_members[gid]), "n_molecules"].sum()),
+            -float(summary.loc[summary["ecfp_family"].isin(group_members[gid]), "max_rank_score"].max()),
+        ),
+    )
+    group_map = {raw_group: i for i, raw_group in enumerate(group_order)}
+    family_to_group = {
+        family_id: group_map[int(raw_group)]
+        for family_id, raw_group in zip(family_ids, raw_groups)
+    }
+    summary["ecfp_group"] = summary["ecfp_family"].astype(int).map(family_to_group).fillna(-1).astype(int)
+    families["ecfp_group"] = families["ecfp_family"].astype(int).map(family_to_group).fillna(-1).astype(int)
+    return families, summary
+
+
+def _write_ecfp_group_summary(run_dir: Path, families: pd.DataFrame, summary: pd.DataFrame) -> None:
+    if families.empty or "ecfp_group" not in families.columns:
+        pd.DataFrame().to_csv(run_dir / "ecfp_group_summary.csv", index=False)
+        return
+    assigned = families[families["ecfp_group"] != -1].copy()
+    rows = []
+    for group_id, sub in assigned.groupby("ecfp_group", sort=True):
+        fam_sub = summary[summary["ecfp_group"] == group_id] if "ecfp_group" in summary else pd.DataFrame()
+        rows.append({
+            "ecfp_group": int(group_id),
+            "n_molecules": int(len(sub)),
+            "n_families": int(sub["ecfp_family"].nunique()) if "ecfp_family" in sub else 0,
+            "top_families": "; ".join(
+                f"F{int(r.ecfp_family)}:n={int(r.n_molecules)}"
+                for r in fam_sub.head(6).itertuples(index=False)
+            ) if not fam_sub.empty else "",
+            "generator_composition": _composition_string(sub.get("generators", pd.Series(dtype=str))),
+            "pocket_composition": _composition_string(sub.get("pocket_ids", pd.Series(dtype=str))),
+            "mean_rank_score": float(pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce").mean()),
+            "max_rank_score": float(pd.to_numeric(sub.get("rank_score", np.nan), errors="coerce").max()),
+        })
+    pd.DataFrame(rows).sort_values(
+        ["n_molecules", "max_rank_score"], ascending=[False, False], na_position="last"
+    ).to_csv(run_dir / "ecfp_group_summary.csv", index=False)
 
 
 def _save_ecfp_family_landscape(families: pd.DataFrame, cfg: Config, out_path: Path) -> None:
@@ -2767,31 +2987,32 @@ def _save_ecfp_family_landscape(families: pd.DataFrame, cfg: Config, out_path: P
     embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
     coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
-    families_sorted = sorted(int(f) for f in embed_df["ecfp_family"].unique())
-    top_families = set(
-        embed_df["ecfp_family"].value_counts().head(20).index.astype(int).tolist()
-    )
+    group_col = "ecfp_group" if "ecfp_group" in embed_df.columns else "ecfp_family"
+    groups_sorted = sorted(int(g) for g in embed_df[group_col].dropna().unique() if int(g) != -1)
+    group_counts = embed_df[group_col].value_counts()
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
     ax = axes[0]
-    cmap = plt.cm.tab20
-    for i, family_id in enumerate(families_sorted):
-        sub = embed_df[embed_df["ecfp_family"] == family_id]
-        color = cmap(i % 20)
-        alpha = 0.75 if family_id in top_families else 0.18
-        label = f"F{family_id} (n={len(sub)})" if family_id in top_families else None
-        ax.scatter(sub["x"], sub["y"], s=18, alpha=alpha, color=color, label=label)
-    ax.set_title("ECFP/Tanimoto modular families")
+    cmap = plt.cm.tab10 if len(groups_sorted) <= 10 else plt.cm.tab20
+    for i, group_id in enumerate(groups_sorted):
+        sub = embed_df[embed_df[group_col].astype(int) == group_id]
+        n_families = int(sub["ecfp_family"].nunique())
+        label = f"G{group_id} ({len(sub)} mols, {n_families} fams)"
+        ax.scatter(
+            sub["x"], sub["y"], s=20, alpha=0.68,
+            color=cmap(i / max(len(groups_sorted) - 1, 1)),
+            label=label,
+        )
+    ax.set_title("Hierarchical ECFP/Tanimoto groups")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
-    if len(top_families) <= 20:
-        ax.legend(frameon=False, fontsize=7, ncol=2)
+    ax.legend(frameon=False, fontsize=7, ncol=1 if len(groups_sorted) <= 8 else 2)
     ax = axes[1]
     if "rank_score" in embed_df.columns:
         scores = pd.to_numeric(embed_df["rank_score"], errors="coerce")
         sc = ax.scatter(embed_df["x"], embed_df["y"], s=18, alpha=0.72, c=scores, cmap="RdYlGn")
         plt.colorbar(sc, ax=ax, shrink=0.8, label="Ranking score")
-    ax.set_title("ECFP families colored by score")
+    ax.set_title("Same projection colored by score")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
-    fig.suptitle("Hierarchical ECFP chemical families (sampled Butina groups)", fontsize=13)
+    fig.suptitle("Hierarchical ECFP chemical modules (sampled Butina families)", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -2828,6 +3049,74 @@ def _save_ecfp_family_tree(run_dir: Path, out_path: Path) -> None:
     dendrogram(linked, labels=labels, orientation="right", ax=ax, color_threshold=0.5)
     ax.set_xlabel("1 - Tanimoto similarity")
     ax.set_title("Hierarchy of top ECFP/Tanimoto families")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_score_summary_plot(
+    summary_csv: Path,
+    out_path: Path,
+    id_col: str,
+    title: str,
+    label_prefix: str,
+    max_rows: int = 16,
+) -> None:
+    _ensure_plot_deps()
+    if not summary_csv.exists():
+        return
+    df = pd.read_csv(summary_csv)
+    if df.empty:
+        return
+    if "mean_score" not in df.columns and "mean_rank_score" in df.columns:
+        df = df.rename(columns={"mean_rank_score": "mean_score"})
+    if "max_score" not in df.columns and "max_rank_score" in df.columns:
+        df = df.rename(columns={"max_rank_score": "max_score"})
+    needed = {id_col, "n_molecules", "mean_score", "max_score"}
+    if not needed.issubset(df.columns):
+        return
+    df["mean_score"] = pd.to_numeric(df["mean_score"], errors="coerce")
+    df["max_score"] = pd.to_numeric(df["max_score"], errors="coerce")
+    df["n_molecules"] = pd.to_numeric(df["n_molecules"], errors="coerce").fillna(0).astype(int)
+    plot_df = df.dropna(subset=["mean_score", "max_score"]).copy()
+    if plot_df.empty:
+        return
+    plot_df = plot_df.sort_values(
+        ["max_score", "mean_score", "n_molecules"],
+        ascending=[False, False, False],
+    ).head(max_rows)
+    labels = [f"{label_prefix}{int(x)}\nn={n}" for x, n in zip(plot_df[id_col], plot_df["n_molecules"])]
+    x = np.arange(len(plot_df))
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(plot_df) * 0.65), 5.6))
+    ax = axes[0]
+    ax.bar(x, plot_df["mean_score"], color="#4E79A7", alpha=0.82, label="mean")
+    ax.scatter(x, plot_df["max_score"], color="#D62728", s=38, zorder=3, label="max")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Ranking score")
+    ax.set_title("Score by group")
+    ax.legend(frameon=False)
+
+    ax = axes[1]
+    size = np.sqrt(plot_df["n_molecules"].clip(lower=1)) * 28
+    sc = ax.scatter(
+        plot_df["n_molecules"],
+        plot_df["mean_score"],
+        s=size,
+        c=plot_df["max_score"],
+        cmap="RdYlGn",
+        alpha=0.78,
+        edgecolor="black",
+        linewidth=0.35,
+    )
+    for _, row in plot_df.head(10).iterrows():
+        ax.text(row["n_molecules"], row["mean_score"], f"{label_prefix}{int(row[id_col])}", fontsize=8)
+    ax.set_xlabel("Molecules in group")
+    ax.set_ylabel("Mean ranking score")
+    ax.set_title("Size vs score")
+    plt.colorbar(sc, ax=ax, shrink=0.8, label="Max ranking score")
+    fig.suptitle(title, fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -3308,6 +3597,7 @@ def _finalize_analysis_outputs(
     _write_source_pocket_predictability(run_dir, generated_df, cfg)
     clustered = _write_presentation_analysis_csvs(run_dir, merged, cfg)
     ecfp_families = _write_ecfp_family_outputs(run_dir, merged, cfg)
+    scaffold_families = _write_scaffold_family_summary(run_dir, merged, cfg)
 
     figures_dir = run_dir / "figures"
     if figures_dir.exists():
@@ -3327,6 +3617,27 @@ def _finalize_analysis_outputs(
     _save_chemical_cluster_umap(clustered, cfg, figures_dir / "chemical_cluster_umap.png")
     _save_ecfp_family_landscape(ecfp_families, cfg, figures_dir / "ecfp_family_landscape.png")
     _save_ecfp_family_tree(run_dir, figures_dir / "ecfp_family_tree.png")
+    _save_score_summary_plot(
+        run_dir / "cluster_summary.csv",
+        figures_dir / "morgan_basin_score_summary.png",
+        id_col="cluster_id",
+        title="Morgan fingerprint basin score summary",
+        label_prefix="C",
+    )
+    _save_score_summary_plot(
+        run_dir / "ecfp_group_summary.csv",
+        figures_dir / "ecfp_group_score_summary.png",
+        id_col="ecfp_group",
+        title="Hierarchical ECFP group score summary",
+        label_prefix="G",
+    )
+    _save_score_summary_plot(
+        run_dir / "scaffold_family_summary.csv",
+        figures_dir / "scaffold_family_score_summary.png",
+        id_col="scaffold_family",
+        title="Scaffold family score summary",
+        label_prefix="F",
+    )
 
     summary = {
         "run_dir": str(run_dir),
