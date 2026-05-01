@@ -1666,7 +1666,6 @@ def generate_all_figures(
                             out_dir / "summary_dashboard.png")
     _save_pocket_generator_heatmap(generated_df, out_dir / "pocket_generator_heatmap.png")
     _save_yield_matrix(generated_df, out_dir / "yield_matrix.png")
-    _save_scaffold_overlap(generated_df, out_dir / "scaffold_overlap.png")
     _save_pocket_druggability(unique_df, pocket_specs, out_dir / "pocket_druggability.png")
 
     # Scaffold family analysis
@@ -3507,27 +3506,6 @@ def _scored_candidates_path(run_dir: Path, scorer: str) -> Path:
     )
 
 
-def _load_cached_run_tables(
-    run_dir: Path, scorer: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[PocketSpec]] | None:
-    generated_path = run_dir / "generated_by_generator.csv"
-    unique_path = run_dir / "unique_generated.csv"
-    scored_path = _scored_candidates_path(run_dir, scorer)
-    if not (generated_path.exists() and unique_path.exists() and scored_path.exists()):
-        return None
-
-    print(
-        f"\nCached run detected: loading {generated_path.name}, "
-        f"{unique_path.name}, and {scored_path.name}",
-        flush=True,
-    )
-    generated_df = pd.read_csv(generated_path)
-    unique_df = pd.read_csv(unique_path)
-    merged = pd.read_csv(scored_path)
-    pocket_specs = read_cached_pocket_specs(run_dir)
-    return generated_df, unique_df, merged, pocket_specs
-
-
 def _write_standard_analysis_csvs(run_dir: Path, generated_df: pd.DataFrame) -> None:
     try:
         build_scaffold_diversity_matrix(generated_df).to_csv(run_dir / "scaffold_diversity_matrix.csv")
@@ -3571,114 +3549,32 @@ def _write_presentation_analysis_csvs(run_dir: Path, merged: pd.DataFrame, cfg: 
         return merged.copy()
 
 
-def _finalize_analysis_outputs(
-    run_dir: Path,
-    run_name: str,
-    cfg: Config,
-    generated_df: pd.DataFrame,
-    merged: pd.DataFrame,
-    pocket_specs: list[PocketSpec],
-    generator_errors: dict[str, str],
-    scorer: str,
-) -> Path:
-    merged = _write_pocket_tanimoto_analysis(run_dir, generated_df, merged, cfg)
-    ranked = merged.copy()
-    ranked["_sort"] = pd.to_numeric(ranked.get("rank_score", 0.0), errors="coerce").fillna(0.0)
-    top_hits = (
-        ranked.sort_values(["_sort", "n_generators", "n_pockets", "qed"],
-                           ascending=[False, False, False, False])
-        .head(16).copy()
-    )
-    top_hits.to_csv(run_dir / "top_unique_hits.csv", index=False)
-
-    _write_standard_analysis_csvs(run_dir, generated_df)
-    _write_pocket_distribution_metrics(run_dir, generated_df, cfg)
-    _write_score_correlation_metrics(run_dir, merged)
-    _write_source_pocket_predictability(run_dir, generated_df, cfg)
-    clustered = _write_presentation_analysis_csvs(run_dir, merged, cfg)
-    ecfp_families = _write_ecfp_family_outputs(run_dir, merged, cfg)
-    scaffold_families = _write_scaffold_family_summary(run_dir, merged, cfg)
-
-    figures_dir = run_dir / "figures"
-    if figures_dir.exists():
-        shutil.rmtree(figures_dir)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-
-    palette = _build_palette(sorted(set(generated_df["generator"])))
-    generate_all_figures(
-        generated_df=generated_df,
-        unique_df=merged,
-        top_hits=top_hits,
-        pocket_specs=pocket_specs,
-        palette=palette,
-        cfg=cfg,
-        out_dir=figures_dir,
-    )
-    _save_chemical_cluster_umap(clustered, cfg, figures_dir / "chemical_cluster_umap.png")
-    _save_ecfp_family_landscape(ecfp_families, cfg, figures_dir / "ecfp_family_landscape.png")
-    _save_ecfp_family_tree(run_dir, figures_dir / "ecfp_family_tree.png")
-    _save_score_summary_plot(
-        run_dir / "cluster_summary.csv",
-        figures_dir / "morgan_basin_score_summary.png",
-        id_col="cluster_id",
-        title="Morgan fingerprint basin score summary",
-        label_prefix="C",
-    )
-    _save_score_summary_plot(
-        run_dir / "ecfp_group_summary.csv",
-        figures_dir / "ecfp_group_score_summary.png",
-        id_col="ecfp_group",
-        title="Hierarchical ECFP group score summary",
-        label_prefix="G",
-    )
-    _save_score_summary_plot(
-        run_dir / "scaffold_family_summary.csv",
-        figures_dir / "scaffold_family_score_summary.png",
-        id_col="scaffold_family",
-        title="Scaffold family score summary",
-        label_prefix="F",
-    )
-
-    summary = {
-        "run_dir": str(run_dir),
-        "run_name": run_name,
-        "pdb_id": cfg.pdb_id,
-        "target_name": cfg.target_name,
-        "generators": list(cfg.generators),
-        "generator_errors": generator_errors,
-        "n_pockets": len(pocket_specs),
-        "pocket_ids": [s.pocket_id for s in pocket_specs],
-        "pocket_sources": [s.pocket_source for s in pocket_specs],
-        "n_generated_rows": int(len(generated_df)),
-        "n_unique_molecules": int(merged["smiles"].nunique()) if "smiles" in merged.columns else int(len(merged)),
-        "scorer": scorer,
-        "top_smiles": top_hits.iloc[0]["smiles"] if not top_hits.empty else None,
-    }
-    (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
-    return run_dir
-
-
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str | None = None) -> Path:
+    from chorus.analysis import (
+        load_cached_run_tables,
+        rebuild_analysis_outputs,
+    )
+
     run_name = run_name or f"{cfg.pdb_id.lower()}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = cfg.paths.results_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     cfg.paths.makedirs()
     scorer = cfg.scorer.strip().lower()
 
-    cached = _load_cached_run_tables(run_dir, scorer)
+    cached = load_cached_run_tables(run_dir, scorer)
     if cached is not None:
         generated_df, unique_df, merged, pocket_specs = cached
         print("Rebuilding analysis CSVs and figures from cached run outputs.", flush=True)
-        return _finalize_analysis_outputs(
+        return rebuild_analysis_outputs(
             run_dir=run_dir,
             run_name=run_name,
             cfg=cfg,
             generated_df=generated_df,
-            merged=merged,
+            scored_df=merged,
             pocket_specs=pocket_specs,
             generator_errors={},
             scorer=scorer,
@@ -3835,12 +3731,12 @@ def run_pipeline(cfg: Config, run_name: str | None = None, anchor_residue: str |
             raise ValueError(f"Unknown scorer: {cfg.scorer!r}. Expected boltz, rtmscore, or none.")
         merged.to_csv(scored_candidates_path, index=False)
 
-    out = _finalize_analysis_outputs(
+    out = rebuild_analysis_outputs(
         run_dir=run_dir,
         run_name=run_name,
         cfg=cfg,
         generated_df=generated_df,
-        merged=merged,
+        scored_df=merged,
         pocket_specs=pocket_specs,
         generator_errors=generator_errors,
         scorer=scorer,
