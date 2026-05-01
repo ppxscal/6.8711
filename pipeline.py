@@ -423,17 +423,53 @@ def read_cached_pocket_specs(run_dir: Path) -> list[PocketSpec]:
     return specs
 
 
+def _download_file_atomic(url: str, dest: Path) -> None:
+    tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        tmp_path.replace(dest)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_p2rank_archive(archive: Path) -> None:
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.getmembers()
+
+
 def ensure_p2rank(cfg: Config) -> Path:
     prank_bin = cfg.paths.p2rank_dir / f"p2rank_{P2RANK_VERSION}" / "prank"
     if prank_bin.exists():
         return prank_bin
     cfg.paths.p2rank_dir.mkdir(parents=True, exist_ok=True)
+    install_dir = prank_bin.parent
     archive = cfg.paths.p2rank_dir / f"p2rank_{P2RANK_VERSION}.tar.gz"
-    if not archive.exists():
+    needs_download = not archive.exists()
+    if not needs_download:
+        try:
+            _validate_p2rank_archive(archive)
+        except (tarfile.TarError, EOFError, OSError) as exc:
+            print(f"P2Rank archive is invalid ({exc}); re-downloading", flush=True)
+            archive.unlink(missing_ok=True)
+            shutil.rmtree(install_dir, ignore_errors=True)
+            needs_download = True
+    if needs_download:
         print(f"Downloading P2Rank {P2RANK_VERSION}")
-        urllib.request.urlretrieve(P2RANK_URL, archive)
-    with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(cfg.paths.p2rank_dir)
+        _download_file_atomic(P2RANK_URL, archive)
+        try:
+            _validate_p2rank_archive(archive)
+        except (tarfile.TarError, EOFError, OSError):
+            archive.unlink(missing_ok=True)
+            raise
+    shutil.rmtree(install_dir, ignore_errors=True)
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(cfg.paths.p2rank_dir)
+    except Exception:
+        shutil.rmtree(install_dir, ignore_errors=True)
+        raise
     if not prank_bin.exists():
         raise RuntimeError(f"P2Rank extraction failed: expected {prank_bin}")
     return prank_bin
