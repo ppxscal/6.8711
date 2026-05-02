@@ -1,17 +1,17 @@
-"""
-generators.py — subprocess utilities, chemistry helpers, and the two
-structure-based ligand generators (DiffSBDD, PocketXMol).
+"""Generator adapters and chemistry utilities for Chorus.
+
+Each adapter wraps an upstream command-line generator and returns validated
+SMILES while preserving the generator's saved 3D poses for downstream scoring.
 """
 from __future__ import annotations
 
-import os
 import random
 import shutil
-import subprocess
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import dataclasses
 import hashlib
 import numpy as np
 import yaml
@@ -20,99 +20,18 @@ from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, QED
 from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
+from chorus.pockets import protein_only_pdb
+from chorus.runtime import env_python, run_command, visible_gpu_env
+
 RDLogger.DisableLog("rdApp.*")
-
-# ---------------------------------------------------------------------------
-# Subprocess / env utilities
-# ---------------------------------------------------------------------------
-
-def run_command(
-    cmd: list[str],
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-    check: bool = True,
-    stream: bool = False,
-    quiet: bool = False,
-) -> subprocess.CompletedProcess:
-    if not quiet:
-        print("$", " ".join(cmd))
-    if stream:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(cwd) if cwd is not None else None,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        collected: list[str] = []
-        assert process.stdout is not None
-        for line in process.stdout:
-            if not quiet:
-                print(line, end="")
-            collected.append(line)
-        returncode = process.wait()
-        stdout = "".join(collected)
-        completed = subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
-    else:
-        completed = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd is not None else None,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        if not quiet:
-            if completed.stdout:
-                print(completed.stdout[-4000:])
-            if completed.stderr and completed.returncode != 0:
-                print(completed.stderr[-4000:])
-    if completed.returncode != 0 and check:
-        stderr_tail = (completed.stderr or "")[-4000:]
-        stdout_tail = (completed.stdout or "")[-4000:]
-        raise RuntimeError(
-            f"Command failed with code {completed.returncode}: {' '.join(cmd)}\n"
-            f"{stderr_tail or stdout_tail}"
-        )
-    return completed
-
-
-def _env_root(env_name: str, paths) -> Path:
-    uv_root = paths.envs_dir / "uv" / env_name
-    if uv_root.exists():
-        return uv_root
-    mamba_root = paths.envs_dir / "micromamba-root" / "envs" / env_name
-    if mamba_root.exists():
-        return mamba_root
-    return paths.envs_dir / env_name
-
-
-def env_python(env_name: str, paths) -> Path:
-    return _env_root(env_name, paths) / "bin" / "python"
-
-
-def env_binary(env_name: str, binary: str, paths) -> Path:
-    return _env_root(env_name, paths) / "bin" / binary
-
-
-def visible_gpu_env(device: str) -> tuple[dict[str, str], str]:
-    env = os.environ.copy()
-    local_device = device
-    if device.startswith("cuda:"):
-        index = device.split(":", 1)[1]
-        env["CUDA_VISIBLE_DEVICES"] = index
-        local_device = "cuda:0"
-    return env, local_device
-
 
 # ---------------------------------------------------------------------------
 # Chemistry utilities
 # ---------------------------------------------------------------------------
 
-_pains_params = FilterCatalogParams()
-_pains_params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-_PAINS_FILTER = FilterCatalog(_pains_params)
+PAINS_PARAMS = FilterCatalogParams()
+PAINS_PARAMS.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+PAINS_FILTER = FilterCatalog(PAINS_PARAMS)
 
 
 def mol_from_smiles(smiles: str) -> Chem.Mol | None:
@@ -130,7 +49,7 @@ def is_valid_smiles(smiles: str) -> bool:
     mol = mol_from_smiles(smiles)
     if mol is None:
         return False
-    if _PAINS_FILTER.HasMatch(mol):
+    if PAINS_FILTER.HasMatch(mol):
         return False
     mw = Descriptors.MolWt(mol)
     return 120 <= mw <= 700
@@ -184,17 +103,16 @@ def ligand_properties(smiles: str) -> dict[str, float]:
 
 def smiles_from_sdf(path: Path) -> list[str]:
     smiles = []
-    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+    supplier = Chem.SDMolSupplier(str(path), sanitize=False, removeHs=False)
     for mol in supplier:
         if mol is None:
             continue
         try:
-            smi = Chem.MolToSmiles(Chem.RemoveHs(mol))
+            clean = Chem.Mol(mol)
+            Chem.SanitizeMol(clean)
+            smi = Chem.MolToSmiles(Chem.RemoveHs(clean))
         except Exception:
-            try:
-                smi = Chem.MolToSmiles(mol)
-            except Exception:
-                continue
+            continue
         if smi:
             smiles.append(smi)
     return smiles
@@ -277,7 +195,7 @@ MOCK_POOLS: dict[str, list[str]] = {
 # DiffSBDD
 # ---------------------------------------------------------------------------
 
-def _divisible_batch(n: int, max_batch: int) -> int:
+def divisible_batch(n: int, max_batch: int) -> int:
     for bs in range(min(n, max_batch), 0, -1):
         if n % bs == 0:
             return bs
@@ -304,18 +222,18 @@ class DiffSBDDCliGenerator(BasePocketGenerator):
         out_dir = out_dir or (self._cfg.paths.results_dir / f"diffsbdd_{int(time.time())}")
         out_dir.mkdir(parents=True, exist_ok=True)
         outfile = out_dir / "diffsbdd_samples.sdf"
+        if not self.spec.contact_residues:
+            raise RuntimeError(f"DiffSBDD needs contact residues for {self.spec.pocket_id}")
+        protein_pdb = protein_only_pdb(self.spec.full_pdb)
         env, _ = visible_gpu_env(self.device)
         run_command(
             [
                 str(self.python), "generate_ligands.py", str(self.checkpoint),
-                "--pdbfile", str(self.spec.full_pdb),
+                "--pdbfile", str(protein_pdb),
                 "--outfile", str(outfile),
-                *(["--ref_ligand", self.spec.ligand_residue_id]
-                  if self.spec.has_reference_ligand
-                  else ["--resi_list", *self.spec.contact_residues]),
+                "--resi_list", *self.spec.contact_residues,
                 "--n_samples", str(n),
-                "--batch_size", str(_divisible_batch(n, 64)),
-                "--sanitize",
+                "--batch_size", str(divisible_batch(n, 64)),
             ],
             cwd=self.repo,
             env=env,
@@ -329,7 +247,7 @@ class DiffSBDDCliGenerator(BasePocketGenerator):
 # PocketXMol
 # ---------------------------------------------------------------------------
 
-def _pxm_simple_noise_config() -> dict:
+def pocketxmol_simple_noise_config() -> dict:
     return {
         "name": "sbdd",
         "num_steps": 100,
@@ -347,7 +265,7 @@ def _pxm_simple_noise_config() -> dict:
     }
 
 
-def _pxm_ar_noise_config() -> dict:
+def pocketxmol_ar_noise_config() -> dict:
     return {
         "name": "maskfill",
         "num_steps": 100,
@@ -384,7 +302,7 @@ def _pxm_ar_noise_config() -> dict:
     }
 
 
-def _write_pxm_config(
+def write_pocketxmol_config(
     spec,
     n: int,
     cfg_dir: Path,
@@ -395,10 +313,10 @@ def _write_pxm_config(
     cx, cy, cz = spec.center
     if sampling_mode == "simple":
         task = {"name": "sbdd", "transform": {"name": "sbdd"}}
-        noise = _pxm_simple_noise_config()
+        noise = pocketxmol_simple_noise_config()
     elif sampling_mode == "ar":
         task = {"name": "sbdd", "transform": {"name": "ar", "part1_pert": "small"}}
-        noise = _pxm_ar_noise_config()
+        noise = pocketxmol_ar_noise_config()
     else:
         raise ValueError(f"Unknown PocketXMol sampling mode: {sampling_mode}")
 
@@ -473,7 +391,7 @@ class PocketXMolCliGenerator(BasePocketGenerator):
 
         chorus_cfg_dir = out_dir / "_config"
         chorus_cfg_dir.mkdir(parents=True, exist_ok=True)
-        task_cfg = _write_pxm_config(
+        task_cfg = write_pocketxmol_config(
             self.spec,
             n,
             chorus_cfg_dir,

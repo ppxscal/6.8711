@@ -1,2 +1,3 @@
 from chorus.analysis import rebuild_analysis_outputs, rebuild_cached_run
-from chorus.pipeline import Config, Paths, run_pipeline
+from chorus.config import Config, Paths
+from chorus.experiment import run_experiment

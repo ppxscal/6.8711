@@ -39,7 +39,7 @@ The panel workflow is:
 5. Score generated poses with RTMScore.
 6. Rebuild analysis CSVs and figures from cached generated/scored CSVs.
 
-RTMScore is the practical default scorer because the generators already produce 3D poses, so scoring is much faster than Boltz-style protein-ligand prediction for every molecule. Boltz remains useful as a higher-cost oracle, but RTMScore enables larger panels and repeated analysis rebuilds.
+RTMScore is the scorer used by this workflow. The generators already produce 3D poses, so RTMScore keeps panel runs and repeated analysis rebuilds practical.
 
 ## Questions Each Analysis Answers
 
@@ -65,16 +65,37 @@ Can simple pocket descriptors predict which generator should be prioritized for 
 
 ## Running
 
-Set up environments:
+From a fresh clone, build the local environments, model checkouts, and cached
+weights:
 
 ```bash
 bash setup.sh all
 ```
 
-Run the full target panel:
+Confirm the expected environments and assets are present:
+
+```bash
+bash setup.sh check
+```
+
+Run a small pilot before launching a larger panel:
+
+```bash
+N_PER_POCKET=200 RUN_PREFIX=pilot_200 bash run_target_panel.sh
+```
+
+Run the current target panel with the script defaults. The public default is a
+compact two-target panel, STK33 (`8VF6`) and GGCT (`2PN7`), at 300 samples per
+generator-pocket:
 
 ```bash
 bash run_target_panel.sh
+```
+
+Override targets explicitly with semicolon-separated `PDB_ID TARGET_NAME` pairs:
+
+```bash
+TARGETS_OVERRIDE="8VF6 STK33;2PN7 GGCT;4W9H VHL" bash run_target_panel.sh
 ```
 
 Regenerate analysis and figures from cached generated/scored CSVs:
@@ -98,9 +119,42 @@ bash setup.sh rascore
 
 RAscore is installed into a separate `envs/uv/rascore` environment because its pretrained XGBoost model depends on older NumPy/pandas/scikit-learn/xgboost versions than the main analysis environment. Analysis uses that env automatically when it exists, caches scores to `ra_scores.csv`, and colors the aggregate PCA by RA score.
 
+## Current Run Status
+
+As of May 2, 2026, the active run is the 300-sample-per-pocket panel for two
+targets:
+
+- `panel_20260502_stk33`: STK33, PDB `8VF6`.
+- `panel_20260502_ggct`: GGCT, PDB `2PN7`.
+
+These runs are still in progress, so the repository should not yet present the
+300-sample outputs as final results. The earlier 200-sample setting is useful
+as a pilot size for setup validation and smoke testing.
+
+If a run is interrupted, rerun the same command with the same `RUN_PREFIX`.
+Completed generator CSVs and scored CSVs are reused where possible. Use
+`REFRESH=true` only when you intentionally want to discard and rebuild a run.
+
 ## Key Outputs
 
 Each run writes to `results/<run_name>/`.
+
+## Code Layout
+
+The code is organized around the experiment flow:
+
+- `config.py`: filesystem paths and run configuration.
+- `pockets.py`: PDB download, P2Rank pocket detection, and cached pocket specs.
+- `generators.py`: DiffSBDD, PocketXMol, and PocketXMolAR adapters.
+- `scoring.py`: RTMScore pose scoring.
+- `experiment.py`: top-level generation/scoring orchestration.
+- `analysis.py`: cached rebuilds, analysis tables, and figures.
+
+Protein structures are normalized before external tools consume them. mmCIF
+downloads are converted to PDB when RCSB does not provide a direct PDB file,
+and tools that only need protein atoms receive sanitized protein-only PDBs.
+This avoids fixed-width PDB parsing failures from modern mmCIF ligand IDs while
+keeping bound-ligand and pocket metadata available to Chorus.
 
 Core tables:
 
@@ -192,17 +246,27 @@ Use `best_score_smiles` for showing what scored well. Use `medoid_smiles` when y
 
 ## Current Interpretation
 
-The early panel suggests three defensible findings:
+Interpretation should be updated after the 300-sample two-target run finishes.
+The intended analysis is comparative rather than absolute: we are measuring how
+generator behavior differs under the same pocket detection and RTMScore scoring
+setup.
+
+The early pilot framing suggests three candidate findings to test:
 
 1. PocketXMol and PocketXMolAR often occupy similar ligand regions, while DiffSBDD can explore distinct regions.
 2. Score distributions vary by target and pocket; some pockets consistently yield stronger RTMScore candidates.
 3. Generator advantage is target-dependent: PocketXMol-family models win in some regions/targets, while DiffSBDD can dominate others.
 
-These are computational findings about generated and scored candidates, not validated binders. The strongest report framing is therefore comparative and diagnostic: this pipeline identifies where generators agree, where they are biased, and which chemical regions deserve follow-up.
+These are computational findings about generated and scored candidates, not
+validated binders. The strongest report framing is therefore comparative and
+diagnostic: this pipeline identifies where generators agree, where they are
+biased, and which chemical regions deserve follow-up.
 
-## Claims We Can Defend
+## Claims The Analysis Is Designed To Test
 
-- Different generators can occupy different ligand-space regions for the same target panel.
+Once the current panel finishes, the analysis is designed to test whether:
+
+- Different generators occupy different ligand-space regions for the same target panel.
 - Generator performance is pocket-dependent under the chosen scoring setup.
 - Some chemical groups are enriched for higher scores and are interpretable through representative structures.
 - Agreement and disagreement across generators can be measured directly rather than inferred from aggregate benchmark numbers alone.

@@ -28,7 +28,7 @@ Examples:
 
 Environment:
   RESULTS_GLOB       Result directories to scan when no positional args are given.
-  SCORER             Override scorer cache to load, e.g. rtmscore or boltz.
+  SCORER             Override scorer cache to load, e.g. rtmscore.
   DEFAULT_SCORER     Used when run_summary.json has no scorer. Default: rtmscore.
   QUIET              Passed through to run.sh. Default: true.
   DRY_RUN            Print planned rebuilds without running them. Default: false.
@@ -49,11 +49,7 @@ fi
 
 scored_cache_name() {
     local scorer="$1"
-    if [[ "$scorer" == "boltz" ]]; then
-        echo "scored_candidates.csv"
-    else
-        echo "scored_candidates_${scorer}.csv"
-    fi
+    echo "scored_candidates_${scorer}.csv"
 }
 
 detect_cpus() {
@@ -147,7 +143,8 @@ fi
 if ((${#run_dirs[@]} == 0)); then
     echo "No result directories matched."
     echo "Set RESULTS_GLOB or pass result directories explicitly."
-    exit 1
+    echo "Nothing to rebuild."
+    exit 0
 fi
 
 RESOLVED_JOBS="$(resolve_jobs "$JOBS" "${#run_dirs[@]}")"

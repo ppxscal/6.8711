@@ -29,12 +29,12 @@ CHORUS_PACKAGES=(
     "matplotlib"
     "rdkit>=2024.3.2"
     "scikit-learn>=1.4"
+    "biopython>=1.83"
     "tqdm"
     "hdbscan"
     "seaborn"
     "PyYAML"
 )
-BOLTZ_SPEC="${BOLTZ_SPEC:-boltz==2.2.1}"
 DIFFSBDD_REPO_URL="${DIFFSBDD_REPO_URL:-https://github.com/arneschneuing/DiffSBDD.git}"
 POCKETXMOL_REPO_URL="${POCKETXMOL_REPO_URL:-https://github.com/pengxingang/PocketXMol.git}"
 RTMSCORE_REPO_URL="${RTMSCORE_REPO_URL:-https://github.com/sc8668/RTMScore.git}"
@@ -133,7 +133,6 @@ Usage: bash setup.sh [target]
 
 Targets:
   chorus          Build the lightweight orchestration/analysis env.
-  boltz           Build the Boltz scoring env.
   rtmscore        Build/download RTMScore repo, model, and env.
   rascore         Build/download Reymond-group RAscore env for RA score analysis.
   models          Clone generator repos and download required checkpoints.
@@ -141,7 +140,7 @@ Targets:
   pocketxmol      Build/download PocketXMol repo, weights, and env.
   generators      Build/download both generator stacks.
   check           Check envs and expected console scripts.
-  all             Build chorus + boltz + rtmscore + rascore + generators, then check.
+  all             Build chorus + rtmscore + rascore + generators, then check.
 
 Environment overrides:
   FORCE=true      Recreate the selected env from scratch.
@@ -155,15 +154,12 @@ Environment overrides:
   PY38=SPEC       Default: $PY38
   TORCH_CUDA=TAG  Default: $TORCH_CUDA
   PYG_TORCH_TAG=TAG Default: $PYG_TORCH_TAG
-  BOLTZ_SPEC=SPEC Default: $BOLTZ_SPEC
 
 Examples:
   bash setup.sh all
   bash setup.sh generators
   bash setup.sh rtmscore
   bash setup.sh rascore
-  FORCE=true bash setup.sh boltz
-  BOLTZ_SPEC='boltz[cuda]==2.2.1' FORCE=true bash setup.sh boltz
 EOF
 }
 
@@ -444,14 +440,17 @@ setup_chorus() {
     make_env chorus "$PY311"
     uv_install chorus --upgrade pip
     uv_install chorus --upgrade "${CHORUS_PACKAGES[@]}"
+    uv_install chorus --editable "$CHORUS_DIR"
     "$(env_python chorus)" - <<'PY'
 import hdbscan
 import matplotlib
 import numpy
 import pandas
+import Bio.PDB
 import rdkit
 import sklearn
 import yaml
+from chorus import Config, Paths, run_experiment
 print("chorus env ok")
 PY
 }
@@ -511,14 +510,6 @@ PY
 setup_generators() {
     setup_diffsbdd
     setup_pocketxmol
-}
-
-setup_boltz() {
-    make_env boltz "$PY311"
-    uv_install boltz --upgrade pip
-    uv_install boltz --upgrade "$BOLTZ_SPEC"
-    NUMBA_CACHE_DIR="$NUMBA_CACHE_DIR" "$(env_python boltz)" "$(env_script boltz boltz)" --help >/dev/null
-    echo "boltz env ok: $(env_script boltz boltz)"
 }
 
 setup_rtmscore() {
@@ -603,19 +594,6 @@ check_env() {
     fi
 }
 
-check_script() {
-    local name="$1"
-    local script="$2"
-    local path
-    path="$(env_script "$name" "$script")"
-    if [[ -x "$path" ]]; then
-        echo "OK  $name script: $path"
-    else
-        echo "BAD $name script: $path"
-        return 1
-    fi
-}
-
 check_imports() {
     local name="$1"
     local code="$2"
@@ -643,9 +621,7 @@ check_path() {
 check_all() {
     local status=0
     check_env chorus || status=1
-    check_imports chorus "import hdbscan, matplotlib, numpy, pandas, rdkit, sklearn" || status=1
-    check_env boltz || status=1
-    check_script boltz boltz || status=1
+    check_imports chorus "import Bio.PDB, hdbscan, matplotlib, numpy, pandas, rdkit, sklearn, yaml" || status=1
     check_env rtmscore || status=1
     check_imports rtmscore "import dgl, MDAnalysis, numpy, openbabel, pandas, prody, rdkit, sklearn, torch, torch_scatter" || status=1
     check_env rascore || status=1
@@ -676,9 +652,6 @@ case "$target" in
     chorus)
         setup_chorus
         ;;
-    boltz)
-        setup_boltz
-        ;;
     rtmscore)
         setup_rtmscore
         ;;
@@ -702,7 +675,6 @@ case "$target" in
         ;;
     all)
         setup_chorus
-        setup_boltz
         setup_rtmscore
         setup_rascore
         setup_generators

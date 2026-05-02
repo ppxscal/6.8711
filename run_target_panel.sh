@@ -3,10 +3,9 @@ set -euo pipefail
 
 CHORUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Defaults are chosen for the six-day term-project run:
-# 5 targets x 4 pockets x 3 generators x 10000 samples
+# Public default is moderate; override N_PER_POCKET for pilot or production panels.
 RUN_PREFIX="${RUN_PREFIX:-panel_$(date +%Y%m%d)}"
-N_PER_POCKET="${N_PER_POCKET:-500}"
+N_PER_POCKET="${N_PER_POCKET:-300}"
 P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 GENERATORS="${GENERATORS:-DiffSBDD,PocketXMol,PocketXMolAR}"
@@ -21,14 +20,14 @@ LOG_DIR="${CHORUS_DIR}/logs/${RUN_PREFIX}"
 mkdir -p "$LOG_DIR"
 
 # Format: "PDB_ID TARGET_NAME"
-# Keep this panel small enough that Boltz scoring completes with time left for analysis.
+# Keep this list compact enough for repeated RTMScore-backed rebuilds.
 TARGETS=(
     "8VF6 STK33"
     "2PN7 GGCT"
-    "4W9H VHL"
-    "4CI2 CRBN"
-    "3MXF BRD4_BD1"
-    "5P9J BTK"
+    # "4W9H VHL"
+    # "4CI2 CRBN"
+    # "3MXF BRD4_BD1"
+    # "5P9J BTK"
     # Optional swap-in if you want a protein-protein-interaction pocket:
     # "4HG7 MDM2"
 )
