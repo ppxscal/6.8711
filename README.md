@@ -186,14 +186,14 @@ Figure folders:
 - `figures/README.md`: per-run index of figure sections.
 - `figures/00_overview/`: start here; compact presentation overview plus aggregate PCA overview.
 - `figures/01_scores/`: RTMScore distributions, top hits, yield, and pocket/generator score summaries.
-- `figures/02_chemical_space/`: aggregate unique-molecule PCA colored by generator, best-scoring pocket, RTMScore, and RA score.
+- `figures/02_chemical_space/`: aggregate unique-molecule PCA colored by generator, conditioning pocket, RTMScore, and RA score.
 - `figures/03_families/`: scaffold and ECFP family landscapes plus representative molecule/scaffold renderings.
 - `figures/04_diagnostics/`: source-pocket and Tanimoto diagnostics for pocket-conditioning behavior.
 
 Main figures:
 
 - `figures/00_overview/main_story_overview.png`: compact stack for presentations and reports.
-- `figures/00_overview/aggregate_pca_overview.png`: aggregate Morgan-fingerprint PCA colored by generator, best-scoring pocket, RTMScore, and RA score.
+- `figures/00_overview/aggregate_pca_overview.png`: aggregate Morgan-fingerprint PCA colored by generator, conditioning pocket, RTMScore, and RA score.
 - `figures/03_families/family_structure_overview.png`: scaffold/ECFP family views supplemented with representative structures.
 - `figures/03_families/representative_scaffold_families.png`: representative scaffold-family cores.
 - `figures/03_families/representative_ecfp_groups.png`: representative ECFP-group molecules.
@@ -210,7 +210,7 @@ Supplementary diagnostics:
 
 Use the main story figure first.
 
-`figures/01_scores/score_distribution_summary.png` answers: which generator and which best-scoring pocket produce higher RTMScore candidates?
+`figures/01_scores/score_distribution_summary.png` answers: which generator and which conditioning pocket produce higher RTMScore candidates?
 
 `figures/00_overview/aggregate_pca_overview.png` answers: do generators occupy different chemical regions, are high-scoring molecules concentrated in particular regions, and are those regions plausibly synthesizable according to RA score?
 

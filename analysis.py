@@ -360,7 +360,7 @@ def save_embedding_overviews(figures_dir: Path) -> None:
     stack_existing_images(
         [("Aggregate unique-molecule PCA", figures_dir / "aggregate_pca_2x2.png")],
         figures_dir / "aggregate_pca_overview.png",
-        title="Aggregate PCA: generator, best pocket, RTMScore, RA score",
+        title="Aggregate PCA: generator, conditioning pocket, RTMScore, RA score",
         width_inches=18.0,
     )
 
@@ -396,9 +396,9 @@ def save_diagnostic_overview(figures_dir: Path) -> None:
 def save_main_story_overview(figures_dir: Path) -> None:
     """Compact figure stack for the report/presentation main text."""
     panels = [
-        ("1. RTMScore distributions by generator and best-scoring pocket",
+        ("1. RTMScore distributions by generator and conditioning pocket",
          figures_dir / "score_distribution_summary.png"),
-        ("2. Chemical space: generator bias, best pocket, and RTMScore",
+        ("2. Chemical space: generator bias, conditioning pocket, and RTMScore",
          figures_dir / "aggregate_pca_2x2.png"),
         ("3. Hierarchical ECFP modules: chemical families and RTMScore",
          figures_dir / "ecfp_family_landscape.png"),
@@ -468,13 +468,16 @@ def save_aggregate_pca_2x2(
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[1]
-    pocket_col = "rtmscore_best_pocket_id" if "rtmscore_best_pocket_id" in embed_df.columns else "pocket_ids"
-    pockets = sorted(embed_df[pocket_col].dropna().astype(str).unique()) if pocket_col in embed_df else []
+    embed_df["conditioning_pocket_label"] = embed_df.get("pocket_ids", pd.Series(index=embed_df.index)).apply(
+        conditioning_pocket_label
+    )
+    pocket_col = "conditioning_pocket_label"
+    pockets = sorted(embed_df[pocket_col].dropna().astype(str).unique())
     colors = plt.cm.tab10(np.linspace(0, 1, max(len(pockets), 1)))
     for i, pocket in enumerate(pockets):
         sub = embed_df[embed_df[pocket_col].astype(str) == pocket]
         ax.scatter(sub["x"], sub["y"], s=14, alpha=0.62, color=colors[i], label=pocket)
-    ax.set_title("Best-scoring pocket")
+    ax.set_title("Conditioning pocket")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[2]
@@ -558,7 +561,8 @@ def save_score_distribution_summary(scored_df: pd.DataFrame, out_path: Path) -> 
         return
 
     generator_col = "rtmscore_best_generator" if "rtmscore_best_generator" in df.columns else "generators"
-    pocket_col = "rtmscore_best_pocket_id" if "rtmscore_best_pocket_id" in df.columns else "pocket_ids"
+    pocket_col = "conditioning_pocket_label"
+    df[pocket_col] = df.get("pocket_ids", pd.Series(index=df.index)).apply(conditioning_pocket_label)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.2))
     boxplot_by_category(
@@ -574,7 +578,7 @@ def save_score_distribution_summary(scored_df: pd.DataFrame, out_path: Path) -> 
         df,
         pocket_col,
         "rank_score",
-        "Score by best-pose pocket",
+        "Score by conditioning pocket",
         "Pocket",
     )
 
@@ -830,7 +834,7 @@ def write_figures_index(figures_dir: Path, sections: dict[str, list[str]]) -> No
     descriptions = {
         "00_overview": "Start here: compact presentation and aggregate PCA overview.",
         "01_scores": "Score distributions, top hits, pocket/generator yield, and score summaries.",
-        "02_chemical_space": "Aggregate unique-molecule PCA colored by generator, best pocket, RTMScore, and RA score.",
+        "02_chemical_space": "Aggregate unique-molecule PCA colored by generator, conditioning pocket, RTMScore, and RA score.",
         "03_families": "Scaffold/ECFP family landscapes and representative molecule or scaffold renderings.",
         "04_diagnostics": "Source-pocket and Tanimoto diagnostics for pocket-conditioning behavior.",
     }
@@ -1023,7 +1027,7 @@ def save_ligand_space(
     unique_df: pd.DataFrame, palette: dict[str, str], cfg: Config, out_path: Path,
     generated_df: pd.DataFrame | None = None,
 ) -> None:
-    """Aggregated unique-molecule PCA colored by generator, recurrence/best pocket, and score."""
+    """Aggregated unique-molecule PCA colored by generator, conditioning pocket, and score."""
     ensure_plot_dependencies()
     if PCA is None:
         return
@@ -1056,12 +1060,15 @@ def save_ligand_space(
     embed_df = pd.DataFrame(keep_rows).reset_index(drop=True)
     coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+    embed_df["conditioning_pocket_label"] = embed_df.get(
+        "pocket_ids", pd.Series(index=embed_df.index)
+    ).apply(conditioning_pocket_label)
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
-    has_best_pocket = "rtmscore_best_pocket_id" in embed_df.columns
+    has_conditioning_pocket = "conditioning_pocket_label" in embed_df.columns
     has_recurrence = "n_pockets" in embed_df.columns
 
-    n_panels = 1 + int(has_best_pocket or has_recurrence) + int(has_score)
+    n_panels = 1 + int(has_conditioning_pocket or has_recurrence) + int(has_score)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
     if n_panels == 1:
         axes = [axes]
@@ -1077,19 +1084,16 @@ def save_ligand_space(
 
     panel = 1
 
-    # Panel 2: this is an aggregated unique-molecule view, so do not color by
-    # comma-joined source pockets. Use best-scoring pose pocket when available,
-    # otherwise show recurrence across source pockets as a continuous value.
-    if has_best_pocket:
+    if has_conditioning_pocket:
         ax = axes[panel]; panel += 1
-        pocket_ids = sorted(embed_df["rtmscore_best_pocket_id"].dropna().unique())
+        pocket_ids = sorted(embed_df["conditioning_pocket_label"].dropna().unique())
         pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
         pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
         for pid in pocket_ids:
-            sub = embed_df[embed_df["rtmscore_best_pocket_id"] == pid]
+            sub = embed_df[embed_df["conditioning_pocket_label"] == pid]
             ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6,
                        color=pocket_palette[pid], label=pid)
-        ax.set_title("Best-scoring pose pocket")
+        ax.set_title("Conditioning pocket")
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
         ax.legend(frameon=False, fontsize=8)
     elif has_recurrence:
@@ -1155,11 +1159,14 @@ def save_ligand_space_umap(
     )
     coords = reducer.fit_transform(np.stack(fps).astype(bool))
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
+    embed_df["conditioning_pocket_label"] = embed_df.get(
+        "pocket_ids", pd.Series(index=embed_df.index)
+    ).apply(conditioning_pocket_label)
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
-    has_best_pocket = "rtmscore_best_pocket_id" in embed_df.columns
+    has_conditioning_pocket = "conditioning_pocket_label" in embed_df.columns
     has_recurrence = "n_pockets" in embed_df.columns
-    n_panels = 1 + int(has_best_pocket or has_recurrence) + int(has_score)
+    n_panels = 1 + int(has_conditioning_pocket or has_recurrence) + int(has_score)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
     if n_panels == 1:
         axes = [axes]
@@ -1173,15 +1180,15 @@ def save_ligand_space_umap(
     ax.legend(frameon=False, fontsize=8)
 
     panel = 1
-    if has_best_pocket:
+    if has_conditioning_pocket:
         ax = axes[panel]; panel += 1
-        pocket_ids = sorted(embed_df["rtmscore_best_pocket_id"].dropna().unique())
+        pocket_ids = sorted(embed_df["conditioning_pocket_label"].dropna().unique())
         pocket_colors = plt.cm.tab10(np.linspace(0, 1, max(len(pocket_ids), 1)))
         pocket_palette = {pid: pocket_colors[i] for i, pid in enumerate(pocket_ids)}
         for pid in pocket_ids:
-            sub = embed_df[embed_df["rtmscore_best_pocket_id"] == pid]
+            sub = embed_df[embed_df["conditioning_pocket_label"] == pid]
             ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, color=pocket_palette[pid], label=pid)
-        ax.set_title("Best-scoring pose pocket")
+        ax.set_title("Conditioning pocket")
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
         ax.legend(frameon=False, fontsize=8)
     elif has_recurrence:
@@ -1642,6 +1649,15 @@ def split_multi_value(value: Any) -> list[str]:
     if pd.isna(value):
         return []
     return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def conditioning_pocket_label(value: Any) -> str:
+    pockets = sorted(set(split_multi_value(value)))
+    if not pockets:
+        return "unknown"
+    if len(pockets) == 1:
+        return pockets[0]
+    return "multiple pockets"
 
 
 def composition_string(values: pd.Series, limit: int = 4) -> str:
