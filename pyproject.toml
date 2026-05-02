@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chorus"
+version = "0.1.0"
+description = "Pocket-conditioned molecular generation and RTMScore analysis workflow."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26,<2",
+    "pandas>=2.2",
+    "matplotlib",
+    "rdkit>=2024.3.2",
+    "scikit-learn>=1.4",
+    "biopython>=1.83",
+    "tqdm",
+    "hdbscan",
+    "seaborn",
+    "PyYAML",
+]
+
+[tool.setuptools]
+packages = ["chorus"]
+package-dir = {chorus = "."}
