@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -108,6 +109,24 @@ def get_devices() -> list[str]:
                 pass
         return devices or ["cpu"]
 
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        devices = [f"cuda:{line.strip()}" for line in output.splitlines() if line.strip()]
+        max_gpus = os.environ.get("MAX_GPUS", "").strip()
+        if max_gpus:
+            try:
+                devices = devices[:max(1, int(max_gpus))]
+            except ValueError:
+                pass
+        if devices:
+            return devices
+    except Exception:
+        pass
+
     if torch is not None and torch.cuda.is_available():
         devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return devices if devices else ["cpu"]
@@ -168,7 +187,7 @@ def run_experiment(cfg: Config, run_name: str | None = None, anchor_residue: str
     first_generators = build_generators(pocket_specs[0], cfg)
     generator_names = list(first_generators.keys())
     devices = get_devices()
-    n_gpus = len(devices)
+    print(f"Detected devices: {', '.join(devices)}", flush=True)
 
     for gen_name in generator_names:
         intermediate_csv = run_dir / f"generated_{gen_name.lower()}.csv"
@@ -185,11 +204,17 @@ def run_experiment(cfg: Config, run_name: str | None = None, anchor_residue: str
         n_pockets = len(pocket_specs)
         total_tasks = n_pockets
         workers_per_gpu = WORKERS_PER_GPU.get(gen_name, 1)
-        max_workers = min(total_tasks, n_gpus * workers_per_gpu)
+        max_workers = min(total_tasks, len(devices) * workers_per_gpu)
+        active_device_count = min(
+            len(devices),
+            max(1, (max_workers + workers_per_gpu - 1) // workers_per_gpu),
+        )
+        active_devices = devices[:active_device_count]
 
         print(
             f"\n=== {gen_name}: {n_pockets} pockets × {cfg.n_generate_per_model_per_pocket} samples "
-            f"({n_gpus} device(s) × {workers_per_gpu} worker(s)/device = {max_workers} parallel) ===",
+            f"({len(active_devices)} device(s) × {workers_per_gpu} worker(s)/device = {max_workers} parallel; "
+            f"using {', '.join(active_devices)}) ===",
             flush=True,
         )
 
@@ -197,7 +222,7 @@ def run_experiment(cfg: Config, run_name: str | None = None, anchor_residue: str
         for i, spec in enumerate(pocket_specs):
             generators = build_generators(spec, cfg)
             gen = generators[gen_name]
-            gen.device = devices[i % n_gpus]
+            gen.device = active_devices[i % len(active_devices)]
             pocket_generators.append((spec, gen))
 
         def _run_pocket(

@@ -92,9 +92,10 @@ generator-pocket:
 bash run_target_panel.sh
 ```
 
-By default, Chorus schedules one pocket task per visible GPU. If the launcher
-environment exposes more GPUs than you want to use, restrict scheduling
-explicitly:
+By default, Chorus schedules one pocket task per visible GPU and caps parallel
+work to the number of detected pockets. The run log prints the detected devices
+and the subset used for each generator. If the launcher environment exposes more
+GPUs than you want to use, restrict scheduling explicitly:
 
 ```bash
 GPU_DEVICES=0,1,2 bash run_target_panel.sh
