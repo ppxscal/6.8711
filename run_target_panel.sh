@@ -15,6 +15,8 @@ REFRESH="${REFRESH:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 TARGETS_OVERRIDE="${TARGETS_OVERRIDE:-}"
 SCORER="${SCORER:-rtmscore}"
+GPU_DEVICES="${GPU_DEVICES:-}"
+MAX_GPUS="${MAX_GPUS:-}"
 
 LOG_DIR="${CHORUS_DIR}/logs/${RUN_PREFIX}"
 mkdir -p "$LOG_DIR"
@@ -58,6 +60,8 @@ run_target() {
     echo "Samples:    ${N_PER_POCKET} per generator-pocket"
     echo "Pockets:    top ${P2RANK_MAX_POCKETS} P2Rank pockets"
     echo "Scorer:     ${SCORER}"
+    [[ -n "$GPU_DEVICES" ]] && echo "GPU devices: ${GPU_DEVICES}"
+    [[ -n "$MAX_GPUS" ]] && echo "Max GPUs:   ${MAX_GPUS}"
     echo "Log:        ${log_path}"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -78,6 +82,8 @@ run_target() {
         QUIET="$QUIET" \
         REFRESH="$REFRESH" \
         SCORER="$SCORER" \
+        GPU_DEVICES="$GPU_DEVICES" \
+        MAX_GPUS="$MAX_GPUS" \
         bash "$CHORUS_DIR/run.sh"
     ) 2>&1 | tee "$log_path"
 }

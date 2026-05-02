@@ -92,10 +92,26 @@ generator-pocket:
 bash run_target_panel.sh
 ```
 
+By default, Chorus schedules one pocket task per visible GPU. If the launcher
+environment exposes more GPUs than you want to use, restrict scheduling
+explicitly:
+
+```bash
+GPU_DEVICES=0,1,2 bash run_target_panel.sh
+MAX_GPUS=3 bash run_target_panel.sh
+```
+
 Override targets explicitly with semicolon-separated `PDB_ID TARGET_NAME` pairs:
 
 ```bash
 TARGETS_OVERRIDE="8VF6 STK33;2PN7 GGCT;4W9H VHL" bash run_target_panel.sh
+```
+
+Limit or select GPUs explicitly when running on a shared machine:
+
+```bash
+GPU_DEVICES=0,1,2 bash run_target_panel.sh
+MAX_GPUS=3 bash run_target_panel.sh
 ```
 
 Regenerate analysis and figures from cached generated/scored CSVs:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -91,6 +92,22 @@ def build_unique_dataframe(generated_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_devices() -> list[str]:
+    requested = os.environ.get("GPU_DEVICES", "").strip()
+    if requested:
+        devices = [f"cuda:{token.strip()}" for token in requested.split(",") if token.strip()]
+        return devices or ["cpu"]
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible not in {"-1", "NoDevFiles"}:
+        devices = [f"cuda:{token.strip()}" for token in visible.split(",") if token.strip()]
+        max_gpus = os.environ.get("MAX_GPUS", "").strip()
+        if max_gpus:
+            try:
+                devices = devices[:max(1, int(max_gpus))]
+            except ValueError:
+                pass
+        return devices or ["cpu"]
+
     if torch is not None and torch.cuda.is_available():
         devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return devices if devices else ["cpu"]
@@ -166,13 +183,13 @@ def run_experiment(cfg: Config, run_name: str | None = None, anchor_residue: str
             continue
 
         n_pockets = len(pocket_specs)
-        workers_per_gpu = WORKERS_PER_GPU.get(gen_name, 1)
-        max_workers = n_gpus * workers_per_gpu
         total_tasks = n_pockets
+        workers_per_gpu = WORKERS_PER_GPU.get(gen_name, 1)
+        max_workers = min(total_tasks, n_gpus * workers_per_gpu)
 
         print(
             f"\n=== {gen_name}: {n_pockets} pockets × {cfg.n_generate_per_model_per_pocket} samples "
-            f"({n_gpus} GPUs × {workers_per_gpu} workers/GPU = {max_workers} parallel) ===",
+            f"({n_gpus} device(s) × {workers_per_gpu} worker(s)/device = {max_workers} parallel) ===",
             flush=True,
         )
 

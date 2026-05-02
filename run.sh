@@ -13,6 +13,8 @@ mkdir -p "$MPLCONFIGDIR"
 RUN_NAME="${RUN_NAME:-}"
 REFRESH="${REFRESH:-false}"
 SCORER="${SCORER:-rtmscore}"
+GPU_DEVICES="${GPU_DEVICES:-}"
+MAX_GPUS="${MAX_GPUS:-}"
 
 scored_cache_name() {
     local scorer
@@ -92,6 +94,8 @@ echo "Max pockets: $P2RANK_MAX_POCKETS"
 [[ -n "$RUN_NAME" ]] && echo "Run name:    $RUN_NAME"
 [[ -n "$GENERATORS" ]] && echo "Generators:  $GENERATORS"
 echo "Scorer:      $SCORER"
+[[ -n "$GPU_DEVICES" ]] && echo "GPU devices: $GPU_DEVICES"
+[[ -n "$MAX_GPUS" ]] && echo "Max GPUs:    $MAX_GPUS"
 echo "Analysis cap: PCA=$MAX_PCA_POINTS UMAP=$MAX_UMAP_POINTS cluster=$MAX_CLUSTER_POINTS"
 echo "ECFP family: sim_threshold=$ECFP_FAMILY_SIM_THRESHOLD"
 echo "Tanimoto:    refs/pocket=$MAX_TANIMOTO_REFS_PER_POCKET top_k=$TANIMOTO_TOP_K"
