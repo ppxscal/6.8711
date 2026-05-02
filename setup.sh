@@ -231,8 +231,8 @@ make_env() {
 
     if [[ -e "$env_dir" ]]; then
         echo "Env exists but its Python is not usable: $env_dir" >&2
-        echo "Rerun with FORCE=true bash setup.sh $name" >&2
-        exit 1
+        echo "Rebuilding managed env in place." >&2
+        rm -rf "$env_dir"
     fi
 
     echo "Creating env: $env_dir with $py"

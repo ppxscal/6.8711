@@ -6,7 +6,7 @@ CHORUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Defaults are chosen for the six-day term-project run:
 # 5 targets x 4 pockets x 3 generators x 10000 samples
 RUN_PREFIX="${RUN_PREFIX:-panel_$(date +%Y%m%d)}"
-N_PER_POCKET="${N_PER_POCKET:-100}"
+N_PER_POCKET="${N_PER_POCKET:-10000}"
 P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 GENERATORS="${GENERATORS:-DiffSBDD,PocketXMol,PocketXMolAR}"
