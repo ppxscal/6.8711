@@ -14,6 +14,19 @@ __pycache__/
 cache/
 logs/
 results/
+envs/
+checkpoints/
+models/
+tools/
+data/*.cif
+data/*.pdb
+data/*_p2rank/
+data/*_pocket*_pocket*.pdb
+data/*_protein_only.pdb
+*.log
+
+# Build artifacts
+*.egg-info/
 
 # Environment and credentials
 .env

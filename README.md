@@ -78,15 +78,13 @@ Confirm the expected environments and assets are present:
 bash setup.sh check
 ```
 
-Run a small pilot before launching a larger panel:
+Run a small smoke test before launching a larger panel:
 
 ```bash
-N_PER_POCKET=200 RUN_PREFIX=pilot_200 bash run_target_panel.sh
+N_PER_POCKET=200 P2RANK_MAX_POCKETS=2 RUN_PREFIX=smoke_200 bash run_target_panel.sh
 ```
 
-Run the current target panel with the script defaults. The public default is a
-compact two-target panel, STK33 (`8VF6`) and GGCT (`2PN7`), at 300 samples per
-generator-pocket:
+Run the configured target panel with the script defaults:
 
 ```bash
 bash run_target_panel.sh
@@ -106,13 +104,6 @@ Override targets explicitly with semicolon-separated `PDB_ID TARGET_NAME` pairs:
 
 ```bash
 TARGETS_OVERRIDE="8VF6 STK33;2PN7 GGCT;4W9H VHL" bash run_target_panel.sh
-```
-
-Limit or select GPUs explicitly when running on a shared machine:
-
-```bash
-GPU_DEVICES=0,1,2 bash run_target_panel.sh
-MAX_GPUS=3 bash run_target_panel.sh
 ```
 
 Regenerate analysis and figures from cached generated/scored CSVs:
@@ -135,18 +126,6 @@ bash setup.sh rascore
 ```
 
 RAscore is installed into a separate `envs/uv/rascore` environment because its pretrained XGBoost model depends on older NumPy/pandas/scikit-learn/xgboost versions than the main analysis environment. Analysis uses that env automatically when it exists, caches scores to `ra_scores.csv`, and colors the aggregate PCA by RA score.
-
-## Current Run Status
-
-As of May 2, 2026, the active run is the 300-sample-per-pocket panel for two
-targets:
-
-- `panel_20260502_stk33`: STK33, PDB `8VF6`.
-- `panel_20260502_ggct`: GGCT, PDB `2PN7`.
-
-These runs are still in progress, so the repository should not yet present the
-300-sample outputs as final results. The earlier 200-sample setting is useful
-as a pilot size for setup validation and smoke testing.
 
 If a run is interrupted, rerun the same command with the same `RUN_PREFIX`.
 Completed generator CSVs and scored CSVs are reused where possible. Use
@@ -263,12 +242,11 @@ Use `best_score_smiles` for showing what scored well. Use `medoid_smiles` when y
 
 ## Current Interpretation
 
-Interpretation should be updated after the 300-sample two-target run finishes.
 The intended analysis is comparative rather than absolute: we are measuring how
 generator behavior differs under the same pocket detection and RTMScore scoring
 setup.
 
-The early pilot framing suggests three candidate findings to test:
+The analysis is designed to test three candidate findings:
 
 1. PocketXMol and PocketXMolAR often occupy similar ligand regions, while DiffSBDD-family variants can explore distinct regions.
 2. Score distributions vary by target and pocket; some pockets consistently yield stronger RTMScore candidates.

@@ -24,7 +24,6 @@ Examples:
   bash rebuild_figures.sh
   DRY_RUN=true bash rebuild_figures.sh
   RESULTS_GLOB='results/panel_20260430_*' bash rebuild_figures.sh
-  MAX_UMAP_POINTS=500 bash rebuild_figures.sh results/panel_20260430_stk33
 
 Environment:
   RESULTS_GLOB       Result directories to scan when no positional args are given.
@@ -37,7 +36,6 @@ Environment:
   MEM_GB_PER_JOB     Memory budget per parallel rebuild when JOBS=auto. Default: 8.
   LOG_DIR            Where per-target rebuild logs are written.
   MAX_PCA_POINTS     Passed through to run.sh if set.
-  MAX_UMAP_POINTS    Passed through to run.sh if set.
   MAX_CLUSTER_POINTS Passed through to run.sh if set.
 EOF
 }

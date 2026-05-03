@@ -73,7 +73,6 @@ MODE="${MODE:-real}"
 QUIET="${QUIET:-true}"
 GENERATORS="${GENERATORS:-}"
 MAX_PCA_POINTS="${MAX_PCA_POINTS:-5000}"
-MAX_UMAP_POINTS="${MAX_UMAP_POINTS:-1000}"
 MAX_CLUSTER_POINTS="${MAX_CLUSTER_POINTS:-1000}"
 ECFP_FAMILY_SIM_THRESHOLD="${ECFP_FAMILY_SIM_THRESHOLD:-0.30}"
 MAX_TANIMOTO_REFS_PER_POCKET="${MAX_TANIMOTO_REFS_PER_POCKET:-500}"
@@ -96,7 +95,7 @@ echo "Max pockets: $P2RANK_MAX_POCKETS"
 echo "Scorer:      $SCORER"
 [[ -n "$GPU_DEVICES" ]] && echo "GPU devices: $GPU_DEVICES"
 [[ -n "$MAX_GPUS" ]] && echo "Max GPUs:    $MAX_GPUS"
-echo "Analysis cap: PCA=$MAX_PCA_POINTS UMAP=$MAX_UMAP_POINTS cluster=$MAX_CLUSTER_POINTS"
+echo "Analysis cap: PCA=$MAX_PCA_POINTS cluster=$MAX_CLUSTER_POINTS"
 echo "ECFP family: sim_threshold=$ECFP_FAMILY_SIM_THRESHOLD"
 echo "Tanimoto:    refs/pocket=$MAX_TANIMOTO_REFS_PER_POCKET top_k=$TANIMOTO_TOP_K"
 [[ -n "$LIGAND_RESNAME" ]] && echo "Ligand:      $LIGAND_RESNAME"
@@ -157,7 +156,6 @@ cfg = Config(
     generator_mode="$MODE",
     scorer="$SCORER",
     max_pca_points=int("$MAX_PCA_POINTS"),
-    max_umap_points=int("$MAX_UMAP_POINTS"),
     max_cluster_points=int("$MAX_CLUSTER_POINTS"),
     ecfp_family_sim_threshold=float("$ECFP_FAMILY_SIM_THRESHOLD"),
     max_tanimoto_refs_per_pocket=int("$MAX_TANIMOTO_REFS_PER_POCKET"),

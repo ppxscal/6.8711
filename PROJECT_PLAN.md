@@ -70,7 +70,7 @@ Keep:
 - representative cluster or scaffold molecules
 
 Preferred target:
-Pick the cleanest and most visually interpretable target after the overnight run. Use one worked example, not several medium-strength examples.
+Pick the cleanest and most visually interpretable completed target. Use one worked example, not several medium-strength examples.
 
 ### 3. Pocket-Specific Comparison
 
@@ -124,7 +124,7 @@ Use these to show example molecules and family-level summaries, not as standalon
 
 ### Router Analysis
 
-Do this only if the overnight run gives enough clean pocket-level examples and the rest of the project is already stable.
+Do this only if the completed panel gives enough clean pocket-level examples and the rest of the project is already stable.
 
 Question:
 Can simple pocket descriptors predict which generator should be prioritized?
@@ -283,7 +283,7 @@ Say:
 
 - results depend on the scoring proxy,
 - no experimental validation,
-- router analysis is future work unless the overnight run makes it strong enough to include.
+- router analysis is future work unless the completed panel makes it strong enough to include.
 
 ## Saturday to Monday Execution Plan
 
@@ -291,7 +291,7 @@ Say:
 
 - clean the repository
 - confirm the final target panel and generation settings
-- launch the overnight run
+- launch the production panel
 - freeze the final figure set and file naming
 
 ### Sunday
