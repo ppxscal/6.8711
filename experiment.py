@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -17,7 +15,8 @@ from tqdm.auto import tqdm
 from chorus.config import Config
 from chorus.generators import BasePocketGenerator, build_generators, get_scaffold, ligand_properties
 from chorus.pockets import PocketSpec, prepare_target_pockets, write_pocket_spec_json
-from chorus.scoring import score_candidates
+from chorus.runtime import discover_devices
+from chorus.scoring import clear_rtmscore_score_cache, score_candidates
 
 try:
     import torch
@@ -71,7 +70,7 @@ def build_unique_dataframe(generated_df: pd.DataFrame) -> pd.DataFrame:
     """Collapse duplicate SMILES while preserving generator and pocket provenance."""
     if generated_df.empty:
         return generated_df.copy()
-    return generated_df.groupby("smiles", sort=False).agg(
+    unique_df = generated_df.groupby("smiles", sort=False).agg(
         scaffold=("scaffold", "first"),
         mw=("mw", "first"),
         logp=("logp", "first"),
@@ -86,6 +85,13 @@ def build_unique_dataframe(generated_df: pd.DataFrame) -> pd.DataFrame:
         n_pockets=("pocket_id", "nunique"),
         source_min_rank=("source_rank", "min"),
     ).reset_index()
+    primary = (
+        generated_df.sort_values(["smiles", "source_rank", "generator", "pocket_id"])
+        .drop_duplicates("smiles")
+        [["smiles", "generator", "pocket_id"]]
+        .rename(columns={"generator": "primary_generator", "pocket_id": "primary_pocket_id"})
+    )
+    return unique_df.merge(primary, on="smiles", how="left")
 
 
 # ---------------------------------------------------------------------------
@@ -93,40 +99,9 @@ def build_unique_dataframe(generated_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_devices() -> list[str]:
-    requested = os.environ.get("GPU_DEVICES", "").strip()
-    if requested:
-        devices = [f"cuda:{token.strip()}" for token in requested.split(",") if token.strip()]
-        return devices or ["cpu"]
-
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if visible and visible not in {"-1", "NoDevFiles"}:
-        devices = [f"cuda:{token.strip()}" for token in visible.split(",") if token.strip()]
-        max_gpus = os.environ.get("MAX_GPUS", "").strip()
-        if max_gpus:
-            try:
-                devices = devices[:max(1, int(max_gpus))]
-            except ValueError:
-                pass
-        return devices or ["cpu"]
-
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-        devices = [f"cuda:{line.strip()}" for line in output.splitlines() if line.strip()]
-        max_gpus = os.environ.get("MAX_GPUS", "").strip()
-        if max_gpus:
-            try:
-                devices = devices[:max(1, int(max_gpus))]
-            except ValueError:
-                pass
-        if devices:
-            return devices
-    except Exception:
-        pass
-
+    devices = discover_devices()
+    if devices != ["cpu"]:
+        return devices
     if torch is not None and torch.cuda.is_available():
         devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return devices if devices else ["cpu"]
@@ -143,6 +118,28 @@ WORKERS_PER_GPU: dict[str, int] = {
 
 def scored_candidates_path(run_dir: Path, scorer: str) -> Path:
     return run_dir / f"scored_candidates_{scorer}.csv"
+
+
+def scored_cache_is_usable(frame: pd.DataFrame, scorer: str) -> bool:
+    if frame.empty:
+        return False
+    if scorer == "rtmscore":
+        has_scores = (
+            "rtmscore_score" in frame.columns
+            and pd.to_numeric(frame["rtmscore_score"], errors="coerce").notna().any()
+        )
+        has_pose_counts = (
+            "rtmscore_n_poses" in frame.columns
+            and pd.to_numeric(frame["rtmscore_n_poses"], errors="coerce").fillna(0).sum() > 0
+        )
+        return bool(has_scores and has_pose_counts)
+    return "rank_score" in frame.columns
+
+
+def clear_scored_cache(run_dir: Path, scorer: str) -> None:
+    scored_candidates_path(run_dir, scorer).unlink(missing_ok=True)
+    if scorer == "rtmscore":
+        clear_rtmscore_score_cache(run_dir / "rtmscore")
 
 
 
@@ -300,6 +297,11 @@ def run_experiment(cfg: Config, run_name: str | None = None, anchor_residue: str
     if scored_path.exists():
         print(f"\n{scorer} scoring: resuming from {scored_path.name}", flush=True)
         merged = pd.read_csv(scored_path)
+        if not scored_cache_is_usable(merged, scorer):
+            print(f"Cached {scored_path.name} is not usable; overwriting scoring cache.", flush=True)
+            clear_scored_cache(run_dir, scorer)
+            merged = score_candidates(generated_df, unique_df, pocket_specs, run_dir, cfg)
+            merged.to_csv(scored_path, index=False)
     else:
         merged = score_candidates(generated_df, unique_df, pocket_specs, run_dir, cfg)
         merged.to_csv(scored_path, index=False)

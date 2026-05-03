@@ -67,6 +67,21 @@ def load_cached_run_tables(
     generated_df = pd.read_csv(generated_path)
     unique_df = pd.read_csv(unique_path)
     scored_df = pd.read_csv(scored_path)
+    if scorer == "rtmscore":
+        has_scores = (
+            "rtmscore_score" in scored_df.columns
+            and pd.to_numeric(scored_df["rtmscore_score"], errors="coerce").notna().any()
+        )
+        has_pose_counts = (
+            "rtmscore_n_poses" in scored_df.columns
+            and pd.to_numeric(scored_df["rtmscore_n_poses"], errors="coerce").fillna(0).sum() > 0
+        )
+        if not (has_scores and has_pose_counts):
+            print(
+                f"Cached {scored_path.name} has no usable RTMScore scores; rerunning scoring.",
+                flush=True,
+            )
+            return None
     pocket_specs = read_cached_pocket_specs(run_dir)
     return generated_df, unique_df, scored_df, pocket_specs
 
@@ -118,6 +133,7 @@ def rebuild_analysis_outputs(
     cached figure rebuilds should call.
     """
 
+    scored_df = add_primary_source_labels(generated_df, scored_df)
     scored_df = add_ra_scores(run_dir, scored_df)
     scored_df = write_pocket_tanimoto_analysis(run_dir, generated_df, scored_df, cfg)
     ranked = scored_df.copy()
@@ -461,14 +477,21 @@ def save_aggregate_pca_2x2(
     cax_ra = fig.add_subplot(gs[1, 3])
 
     ax = axes[0]
-    for gen in sorted(embed_df["generators"].dropna().astype(str).unique()):
-        sub = embed_df[embed_df["generators"].astype(str) == gen]
-        ax.scatter(sub["x"], sub["y"], s=14, alpha=0.58, c=palette.get(gen, "#4E79A7"), label=gen)
+    embed_df["generator_label"] = embed_df.get(
+        "primary_generator", embed_df.get("generators", pd.Series(index=embed_df.index))
+    ).apply(
+        generator_provenance_label
+    )
+    for label in sorted(embed_df["generator_label"].dropna().astype(str).unique()):
+        sub = embed_df[embed_df["generator_label"].astype(str) == label]
+        ax.scatter(sub["x"], sub["y"], s=14, alpha=0.58, c=palette.get(label, "#4E79A7"), label=label)
     ax.set_title("Generator")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[1]
-    embed_df["conditioning_pocket_label"] = embed_df.get("pocket_ids", pd.Series(index=embed_df.index)).apply(
+    embed_df["conditioning_pocket_label"] = embed_df.get(
+        "primary_pocket_id", embed_df.get("pocket_ids", pd.Series(index=embed_df.index))
+    ).apply(
         conditioning_pocket_label
     )
     pocket_col = "conditioning_pocket_label"
@@ -560,9 +583,18 @@ def save_score_distribution_summary(scored_df: pd.DataFrame, out_path: Path) -> 
     if df.empty:
         return
 
-    generator_col = "rtmscore_best_generator" if "rtmscore_best_generator" in df.columns else "generators"
+    if "rtmscore_best_generator" in df.columns:
+        generator_col = "best_generator_label"
+        df[generator_col] = df["rtmscore_best_generator"].apply(display_generator_name)
+    else:
+        generator_col = "generator_label"
+        df[generator_col] = df.get(
+            "primary_generator", df.get("generators", pd.Series(index=df.index))
+        ).apply(generator_provenance_label)
     pocket_col = "conditioning_pocket_label"
-    df[pocket_col] = df.get("pocket_ids", pd.Series(index=df.index)).apply(conditioning_pocket_label)
+    df[pocket_col] = df.get(
+        "primary_pocket_id", df.get("pocket_ids", pd.Series(index=df.index))
+    ).apply(conditioning_pocket_label)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.2))
     boxplot_by_category(
@@ -1061,7 +1093,7 @@ def save_ligand_space(
     coords = PCA(n_components=2, random_state=cfg.seed).fit_transform(np.stack(fps))
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
     embed_df["conditioning_pocket_label"] = embed_df.get(
-        "pocket_ids", pd.Series(index=embed_df.index)
+        "primary_pocket_id", embed_df.get("pocket_ids", pd.Series(index=embed_df.index))
     ).apply(conditioning_pocket_label)
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
@@ -1075,9 +1107,14 @@ def save_ligand_space(
 
     # Panel 1: colored by generator
     ax = axes[0]
-    for gen in sorted(embed_df["generators"].dropna().unique()):
-        sub = embed_df[embed_df["generators"] == gen]
-        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, c=palette.get(gen, "#4E79A7"), label=gen)
+    embed_df["generator_label"] = embed_df.get(
+        "primary_generator", embed_df.get("generators", pd.Series(index=embed_df.index))
+    ).apply(
+        generator_provenance_label
+    )
+    for label in sorted(embed_df["generator_label"].dropna().unique()):
+        sub = embed_df[embed_df["generator_label"] == label]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, c=palette.get(label, "#4E79A7"), label=label)
     ax.set_title("Colored by generator")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
     ax.legend(frameon=False, fontsize=8)
@@ -1160,7 +1197,7 @@ def save_ligand_space_umap(
     coords = reducer.fit_transform(np.stack(fps).astype(bool))
     embed_df["x"], embed_df["y"] = coords[:, 0], coords[:, 1]
     embed_df["conditioning_pocket_label"] = embed_df.get(
-        "pocket_ids", pd.Series(index=embed_df.index)
+        "primary_pocket_id", embed_df.get("pocket_ids", pd.Series(index=embed_df.index))
     ).apply(conditioning_pocket_label)
 
     has_score = "rank_score" in embed_df.columns and embed_df["rank_score"].notna().any()
@@ -1172,9 +1209,14 @@ def save_ligand_space_umap(
         axes = [axes]
 
     ax = axes[0]
-    for gen in sorted(embed_df["generators"].dropna().unique()):
-        sub = embed_df[embed_df["generators"] == gen]
-        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, c=palette.get(gen, "#4E79A7"), label=gen)
+    embed_df["generator_label"] = embed_df.get(
+        "primary_generator", embed_df.get("generators", pd.Series(index=embed_df.index))
+    ).apply(
+        generator_provenance_label
+    )
+    for label in sorted(embed_df["generator_label"].dropna().unique()):
+        sub = embed_df[embed_df["generator_label"] == label]
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.6, c=palette.get(label, "#4E79A7"), label=label)
     ax.set_title("Colored by generator")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     ax.legend(frameon=False, fontsize=8)
@@ -1268,7 +1310,8 @@ def save_source_pocket_ligand_space(
     ax = axes[0]
     for gen in sorted(embed_df["generator"].dropna().unique()):
         sub = embed_df[embed_df["generator"] == gen]
-        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.55, c=palette.get(gen, "#4E79A7"), label=gen)
+        label = display_generator_name(gen)
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.55, c=palette.get(label, "#4E79A7"), label=label)
     ax.set_title("Source rows colored by generator")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
     ax.legend(frameon=False, fontsize=8)
@@ -1346,7 +1389,8 @@ def save_source_pocket_ligand_space_umap(
     ax = axes[0]
     for gen in sorted(embed_df["generator"].dropna().unique()):
         sub = embed_df[embed_df["generator"] == gen]
-        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.58, c=palette.get(gen, "#4E79A7"), label=gen)
+        label = display_generator_name(gen)
+        ax.scatter(sub["x"], sub["y"], s=18, alpha=0.58, c=palette.get(label, "#4E79A7"), label=label)
     ax.set_title("Source rows colored by generator")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     ax.legend(frameon=False, fontsize=8)
@@ -1651,13 +1695,54 @@ def split_multi_value(value: Any) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
+def first_multi_value(value: Any) -> str:
+    values = split_multi_value(value)
+    return values[0] if values else "unknown"
+
+
+GENERATOR_DISPLAY_NAMES = {
+    "DiffSBDD": "DiffSBDD cond",
+    "DiffSBDDJoint": "DiffSBDD joint",
+}
+
+
+def display_generator_name(name: Any) -> str:
+    text = str(name)
+    return GENERATOR_DISPLAY_NAMES.get(text, text)
+
+
+def generator_provenance_label(value: Any) -> str:
+    return display_generator_name(first_multi_value(value))
+
+
 def conditioning_pocket_label(value: Any) -> str:
-    pockets = sorted(set(split_multi_value(value)))
-    if not pockets:
-        return "unknown"
-    if len(pockets) == 1:
-        return pockets[0]
-    return "multiple pockets"
+    return first_multi_value(value)
+
+
+def add_primary_source_labels(generated_df: pd.DataFrame, unique_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach one source generator and pocket per unique molecule for aggregate plots."""
+    if unique_df.empty or generated_df.empty or "smiles" not in unique_df.columns:
+        return unique_df.copy()
+
+    required = {"smiles", "generator", "pocket_id"}
+    if not required.issubset(generated_df.columns):
+        return unique_df.copy()
+
+    sort_cols = ["smiles"]
+    if "source_rank" in generated_df.columns:
+        sort_cols.append("source_rank")
+    sort_cols.extend(["generator", "pocket_id"])
+
+    primary = (
+        generated_df.sort_values(sort_cols)
+        .drop_duplicates("smiles")
+        [["smiles", "generator", "pocket_id"]]
+        .rename(columns={"generator": "primary_generator", "pocket_id": "primary_pocket_id"})
+    )
+    out = unique_df.drop(
+        columns=[c for c in ("primary_generator", "primary_pocket_id") if c in unique_df.columns]
+    ).merge(primary, on="smiles", how="left")
+    return out
 
 
 def composition_string(values: pd.Series, limit: int = 4) -> str:
@@ -2774,7 +2859,8 @@ def save_pocket_druggability(
 
 def build_generator_palette(generator_names: list[str]) -> dict[str, str]:
     base = ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#76B7B2", "#EDC948"]
-    return {name: base[i % len(base)] for i, name in enumerate(sorted(generator_names))}
+    labels = sorted({display_generator_name(name) for name in generator_names})
+    return {name: base[i % len(base)] for i, name in enumerate(labels)}
 
 
 def write_standard_analysis_csvs(run_dir: Path, generated_df: pd.DataFrame) -> None:

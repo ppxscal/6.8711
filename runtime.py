@@ -76,6 +76,44 @@ def env_binary(env_name: str, binary: str, paths) -> Path:
     return env_root(env_name, paths) / "bin" / binary
 
 
+def discover_devices() -> list[str]:
+    requested = os.environ.get("GPU_DEVICES", "").strip()
+    if requested:
+        devices = [f"cuda:{token.strip()}" for token in requested.split(",") if token.strip()]
+        return devices or ["cpu"]
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible not in {"-1", "NoDevFiles"}:
+        devices = [f"cuda:{token.strip()}" for token in visible.split(",") if token.strip()]
+        max_gpus = os.environ.get("MAX_GPUS", "").strip()
+        if max_gpus:
+            try:
+                devices = devices[:max(1, int(max_gpus))]
+            except ValueError:
+                pass
+        return devices or ["cpu"]
+
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        devices = [f"cuda:{line.strip()}" for line in output.splitlines() if line.strip()]
+        max_gpus = os.environ.get("MAX_GPUS", "").strip()
+        if max_gpus:
+            try:
+                devices = devices[:max(1, int(max_gpus))]
+            except ValueError:
+                pass
+        if devices:
+            return devices
+    except Exception:
+        pass
+
+    return ["cpu"]
+
+
 def visible_gpu_env(device: str) -> tuple[dict[str, str], str]:
     env = os.environ.copy()
     local_device = device
@@ -84,4 +122,3 @@ def visible_gpu_env(device: str) -> tuple[dict[str, str], str]:
         env["CUDA_VISIBLE_DEVICES"] = index
         local_device = "cuda:0"
     return env, local_device
-

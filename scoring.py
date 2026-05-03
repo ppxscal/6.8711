@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from chorus.config import Config
 from chorus.generators import ligand_properties
 from chorus.pockets import PocketSpec
-from chorus.runtime import env_python, run_command, visible_gpu_env
+from chorus.runtime import discover_devices, env_python, run_command, visible_gpu_env
 
 try:
     import torch
@@ -268,6 +268,9 @@ class RTMScorePoseOracle:
         return [str(p) for p in (self.repo, self.python, self.script, self.model) if not p.exists()]
 
     def get_devices(self) -> list[str]:
+        devices = discover_devices()
+        if devices != ["cpu"]:
+            return devices
         if torch is not None and torch.cuda.is_available():
             devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
             return devices if devices else ["cpu"]
@@ -289,6 +292,14 @@ class RTMScorePoseOracle:
         existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.repo) if not existing_pp else f"{self.repo}:{existing_pp}"
         env.setdefault("RTMSCORE_NUM_WORKERS", "0")
+        env.setdefault("DGLBACKEND", "pytorch")
+        rtmscore_home = self._cfg.paths.cache_dir / "rtmscore_home"
+        dgl_cache = self._cfg.paths.cache_dir / "dgl"
+        rtmscore_home.mkdir(parents=True, exist_ok=True)
+        dgl_cache.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(rtmscore_home)
+        env["DGL_DOWNLOAD_DIR"] = str(dgl_cache)
+        env["XDG_CACHE_HOME"] = str(self._cfg.paths.cache_dir)
         cmd = [
             str(self.python), str(self.script),
             "-p", str(pocket_pdb),
@@ -417,6 +428,22 @@ class RTMScorePoseOracle:
         return pd.concat(score_frames, ignore_index=True)
 
 
+def usable_rtmscore_scores(frame: pd.DataFrame) -> bool:
+    return (
+        not frame.empty
+        and "rtmscore_score" in frame.columns
+        and pd.to_numeric(frame["rtmscore_score"], errors="coerce").notna().any()
+    )
+
+
+def clear_rtmscore_score_cache(score_dir: Path) -> None:
+    """Remove score artifacts while preserving RTMScore input SDFs and manifests."""
+    for path in score_dir.glob("pocket_*_scores.csv"):
+        path.unlink(missing_ok=True)
+    for name in ("rtmscore_pose_scores.csv", "rtmscore_pose_level.csv"):
+        (score_dir / name).unlink(missing_ok=True)
+
+
 def aggregate_rtmscore_scores(
     unique_df: pd.DataFrame,
     pose_manifest: pd.DataFrame,
@@ -479,7 +506,14 @@ def score_with_rtmscore(
     if pose_scores_path.exists():
         print(f"\nRTMScore scoring: resuming from {pose_scores_path.name}", flush=True)
         pose_scores = pd.read_csv(pose_scores_path)
+        if not usable_rtmscore_scores(pose_scores):
+            print("Cached RTMScore pose scores are invalid; overwriting score cache.", flush=True)
+            clear_rtmscore_score_cache(score_dir)
+            pose_scores = pd.DataFrame()
     else:
+        pose_scores = pd.DataFrame()
+
+    if pose_scores.empty:
         oracle = RTMScorePoseOracle(cfg)
         pose_scores = oracle.score(
             pose_manifest=pose_manifest,
@@ -487,6 +521,11 @@ def score_with_rtmscore(
             pocket_specs=pocket_specs,
             score_dir=score_dir,
         )
+        if not usable_rtmscore_scores(pose_scores):
+            raise RuntimeError(
+                "RTMScore produced no usable scores. The run was not marked scored; "
+                "fix the RTMScore/DGL environment and rerun with the same RUN_PREFIX."
+            )
         pose_scores.to_csv(pose_scores_path, index=False)
 
     pose_level = pose_manifest.merge(pose_scores, on=["pose_id", "pocket_id"], how="left")
