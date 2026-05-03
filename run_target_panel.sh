@@ -24,8 +24,8 @@ mkdir -p "$LOG_DIR"
 # Format: "PDB_ID TARGET_NAME"
 # PROTAC-relevant panel: cancer targets plus canonical degradation targets/E3 ligases.
 TARGETS=(
-    "8VF6 STK33"
     "2PN7 GGCT"
+    "8VF6 STK33"
     "3MXF BRD4_BD1"
     "5P9J BTK"
     "4W9H VHL"
