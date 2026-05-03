@@ -4,7 +4,7 @@ This document is the working spine for the class project. It is intentionally na
 
 ## One-Sentence Hypothesis
 
-Pocket-conditioned ligand generators are not interchangeable: for the same protein pockets, different generator architectures produce different chemotypes and different score versus synthesizability tradeoffs.
+Pocket-conditioned ligand generators are not interchangeable: for the same protein pockets, different generator architectures and conditioning/sampling variants produce different chemotypes and different score versus synthesizability tradeoffs.
 
 ## Named Contribution
 
@@ -18,7 +18,7 @@ Most recent structure-based generative papers focus on building a stronger singl
 
 This project addresses that gap by running multiple strong generators on the same detected pockets, scoring their outputs, and analyzing:
 
-- which generators perform better on which pockets,
+- which generator or architecture variant performs better on which pockets,
 - whether high-scoring regions are also synthetically plausible,
 - which chemical families are shared versus model-specific,
 - and whether generator disagreement is structured rather than random.
@@ -47,7 +47,7 @@ Do different generators produce different score and synthesizability profiles ac
 
 Keep:
 
-- score distribution summary by generator
+- score distribution summary by generator or architecture variant
 - score distribution summary by best-scoring pocket
 - generator-by-pocket heatmap or summary table
 - RTMScore versus RA score comparison
@@ -187,10 +187,10 @@ Briefly cover CrossDocked-style structure-based benchmarks and the selected gene
 
 5. Methods
 Explain the obvious approach and why it is insufficient:
-run one generator and report aggregate metrics.
+run one generator or one architecture variant and report aggregate metrics.
 
 Then explain the fix:
-run multiple generators on the same pockets, score them, and analyze score, synthesizability, and chemical-space structure.
+run multiple architecture variants on the same pockets, score them, and analyze score, synthesizability, and chemical-space structure.
 
 6. Results
 Use the same sequence as the Final Analysis Plan above.
@@ -215,7 +215,7 @@ Title:
 Pocket-Aware Ensemble Audit for Ligand Generation
 
 Say:
-We asked whether strong pocket-conditioned generators are interchangeable, or whether different architectures produce different chemistry and practical tradeoffs on the same protein pockets.
+We asked whether strong pocket-conditioned generators are interchangeable, or whether different architectures and within-family variants produce different chemistry and practical tradeoffs on the same protein pockets.
 
 ### Slide 2. Why This Problem Matters
 

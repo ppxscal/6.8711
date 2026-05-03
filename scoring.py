@@ -162,9 +162,10 @@ def collect_diffsbdd_pose_records(
     run_dir: Path,
     generated_df: pd.DataFrame,
     allowed: set[tuple[str, str, str]],
+    generator_name: str = "DiffSBDD",
 ) -> list[tuple[PoseRecord, Chem.Mol]]:
     rows: list[tuple[PoseRecord, Chem.Mol]] = []
-    root = run_dir / "generator_outputs" / "diffsbdd"
+    root = run_dir / "generator_outputs" / generator_name.lower()
     if not root.exists():
         return rows
 
@@ -180,14 +181,14 @@ def collect_diffsbdd_pose_records(
             smi = canonical_smiles_from_mol(mol) or ""
             if not smi or not ligand_properties(smi):
                 continue
-            if ("DiffSBDD", pocket_id, smi) not in allowed:
+            if (generator_name, pocket_id, smi) not in allowed:
                 continue
-            pose_id = pose_id_for("DiffSBDD", pocket_id, sdf_path, mol_idx)
+            pose_id = pose_id_for(generator_name, pocket_id, sdf_path, mol_idx)
             rows.append((
                 PoseRecord(
                     pose_id=pose_id,
                     smiles=smi,
-                    generator="DiffSBDD",
+                    generator=generator_name,
                     pocket_id=pocket_id,
                     source_rank=mol_idx + 1,
                     pose_sdf=str(sdf_path),
@@ -205,7 +206,8 @@ def build_rtmscore_pose_batches(
     """Build one RTMScore SDF batch per pocket from saved generator 3D poses."""
     allowed = allowed_pose_keys(generated_df)
     pose_mols: list[tuple[PoseRecord, Chem.Mol]] = []
-    pose_mols.extend(collect_diffsbdd_pose_records(run_dir, generated_df, allowed))
+    pose_mols.extend(collect_diffsbdd_pose_records(run_dir, generated_df, allowed, "DiffSBDD"))
+    pose_mols.extend(collect_diffsbdd_pose_records(run_dir, generated_df, allowed, "DiffSBDDJoint"))
     pose_mols.extend(collect_pocketxmol_pose_records(run_dir, generated_df, "PocketXMol", allowed))
     pose_mols.extend(collect_pocketxmol_pose_records(run_dir, generated_df, "PocketXMolAR", allowed))
 

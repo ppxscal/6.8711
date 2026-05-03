@@ -134,9 +134,10 @@ def get_devices() -> list[str]:
 
 
 WORKERS_PER_GPU: dict[str, int] = {
-    "DiffSBDD":     1,
-    "PocketXMol":   1,
-    "PocketXMolAR": 1,
+    "DiffSBDD":      1,
+    "DiffSBDDJoint": 1,
+    "PocketXMol":    1,
+    "PocketXMolAR":  1,
 }
 
 

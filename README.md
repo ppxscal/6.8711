@@ -34,7 +34,7 @@ The panel workflow is:
 
 1. Select target proteins and names in `run_target_panel.sh`.
 2. Detect candidate binding pockets with P2Rank.
-3. Generate molecules independently for each detected pocket with DiffSBDD, PocketXMol, and PocketXMolAR.
+3. Generate molecules independently for each detected pocket with DiffSBDD, DiffSBDDJoint, PocketXMol, and PocketXMolAR.
 4. Deduplicate generated SMILES across generators and pockets.
 5. Score generated poses with RTMScore.
 6. Rebuild analysis CSVs and figures from cached generated/scored CSVs.
@@ -162,7 +162,7 @@ The code is organized around the experiment flow:
 
 - `config.py`: filesystem paths and run configuration.
 - `pockets.py`: PDB download, P2Rank pocket detection, and cached pocket specs.
-- `generators.py`: DiffSBDD, PocketXMol, and PocketXMolAR adapters.
+- `generators.py`: DiffSBDD conditional/joint, PocketXMol, and PocketXMolAR adapters.
 - `scoring.py`: RTMScore pose scoring.
 - `experiment.py`: top-level generation/scoring orchestration.
 - `analysis.py`: cached rebuilds, analysis tables, and figures.
@@ -236,7 +236,7 @@ Pocket properties induce generator-specific chemotype preferences, so a multi-ge
 Using one fixed generator for every pocket assumes the models are interchangeable.
 
 4. Test:
-Run the same pockets through DiffSBDD, PocketXMol, and PocketXMolAR, score their outputs, and compare both score distributions and chemical-space occupancy.
+Run the same pockets through DiffSBDD, DiffSBDDJoint, PocketXMol, and PocketXMolAR, score their outputs, and compare both score distributions and chemical-space occupancy.
 
 5. Interpretation:
 Measure whether disagreement is random noise or organized into pocket-linked chemical neighborhoods and scaffold families.
@@ -270,9 +270,9 @@ setup.
 
 The early pilot framing suggests three candidate findings to test:
 
-1. PocketXMol and PocketXMolAR often occupy similar ligand regions, while DiffSBDD can explore distinct regions.
+1. PocketXMol and PocketXMolAR often occupy similar ligand regions, while DiffSBDD-family variants can explore distinct regions.
 2. Score distributions vary by target and pocket; some pockets consistently yield stronger RTMScore candidates.
-3. Generator advantage is target-dependent: PocketXMol-family models win in some regions/targets, while DiffSBDD can dominate others.
+3. Generator advantage is target-dependent: PocketXMol-family models win in some regions/targets, while DiffSBDD-family variants can dominate others.
 
 These are computational findings about generated and scored candidates, not
 validated binders. The strongest report framing is therefore comparative and

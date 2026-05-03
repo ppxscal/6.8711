@@ -40,6 +40,7 @@ POCKETXMOL_REPO_URL="${POCKETXMOL_REPO_URL:-https://github.com/pengxingang/Pocke
 RTMSCORE_REPO_URL="${RTMSCORE_REPO_URL:-https://github.com/sc8668/RTMScore.git}"
 RASCORE_REPO_URL="${RASCORE_REPO_URL:-https://github.com/reymond-group/RAscore.git}"
 DIFFSBDD_CKPT_URL="${DIFFSBDD_CKPT_URL:-https://zenodo.org/record/8183747/files/crossdocked_fullatom_cond.ckpt?download=1}"
+DIFFSBDD_JOINT_CKPT_URL="${DIFFSBDD_JOINT_CKPT_URL:-https://zenodo.org/record/8183747/files/crossdocked_fullatom_joint.ckpt?download=1}"
 POCKETXMOL_WEIGHTS_URL="${POCKETXMOL_WEIGHTS_URL:-https://zenodo.org/records/17801271/files/model_weights.tar.gz?download=1}"
 TORCH_CUDA="${TORCH_CUDA:-cu118}"
 TORCH_VERSION="${TORCH_VERSION:-2.0.1}"
@@ -386,6 +387,9 @@ ensure_diffsbdd_checkpoint() {
     download_file \
         "$DIFFSBDD_CKPT_URL" \
         "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_cond.ckpt"
+    download_file \
+        "$DIFFSBDD_JOINT_CKPT_URL" \
+        "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_joint.ckpt"
 }
 
 ensure_pocketxmol_weights() {
@@ -631,7 +635,8 @@ check_all() {
     check_env pocketxmol || status=1
     check_imports pocketxmol "from openbabel import openbabel; import Bio, easydict, lmdb, rdkit, torch, torch_geometric, torch_scatter, torch_sparse, torch_cluster" || status=1
     check_path "diffsbdd repo" "$MODELS_DIR/diffsbdd/generate_ligands.py" || status=1
-    check_path "diffsbdd checkpoint" "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_cond.ckpt" || status=1
+    check_path "diffsbdd cond checkpoint" "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_cond.ckpt" || status=1
+    check_path "diffsbdd joint checkpoint" "$CHECKPOINTS_DIR/diffsbdd/crossdocked_fullatom_joint.ckpt" || status=1
     check_path "pocketxmol repo" "$MODELS_DIR/pocketxmol/scripts/sample_use.py" || status=1
     check_path "pocketxmol checkpoint" "$CHECKPOINTS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt" || status=1
     check_path "pocketxmol repo checkpoint link" "$MODELS_DIR/pocketxmol/data/trained_models/pxm/checkpoints/pocketxmol.ckpt" || status=1

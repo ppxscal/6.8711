@@ -189,6 +189,7 @@ MOCK_POOLS: dict[str, list[str]] = {
         "CC(NC(=O)c1ccc(F)cc1)c1ccccc1",
     ],
 }
+MOCK_POOLS["DiffSBDDJoint"] = MOCK_POOLS["DiffSBDD"]
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +206,15 @@ def divisible_batch(n: int, max_batch: int) -> int:
 class DiffSBDDCliGenerator(BasePocketGenerator):
     """Wrapper around DiffSBDD's generate_ligands.py CLI."""
 
+    generator_name = "DiffSBDD"
+    checkpoint_name = "crossdocked_fullatom_cond.ckpt"
+
     def __init__(self, spec, cfg, device: str = "cpu"):
-        super().__init__(name="DiffSBDD", spec=spec, device=device)
+        super().__init__(name=self.generator_name, spec=spec, device=device)
         self._cfg = cfg
         self.repo = cfg.paths.models_dir / "diffsbdd"
         self.python = env_python("diffsbdd", cfg.paths)
-        self.checkpoint = cfg.paths.checkpoints_dir / "diffsbdd" / "crossdocked_fullatom_cond.ckpt"
+        self.checkpoint = cfg.paths.checkpoints_dir / "diffsbdd" / self.checkpoint_name
 
     def ready(self) -> bool:
         return self.repo.exists() and self.python.exists() and self.checkpoint.exists()
@@ -241,6 +245,13 @@ class DiffSBDDCliGenerator(BasePocketGenerator):
             quiet=self._cfg.quiet,
         )
         return smiles_from_sdf(outfile)
+
+
+class DiffSBDDJointCliGenerator(DiffSBDDCliGenerator):
+    """DiffSBDD joint pocket-ligand checkpoint exposed as a separate variant."""
+
+    generator_name = "DiffSBDDJoint"
+    checkpoint_name = "crossdocked_fullatom_joint.ckpt"
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +464,7 @@ class PocketXMolARCliGenerator(PocketXMolCliGenerator):
 
 GENERATOR_REGISTRY: dict[str, type[BasePocketGenerator]] = {
     "DiffSBDD": DiffSBDDCliGenerator,
+    "DiffSBDDJoint": DiffSBDDJointCliGenerator,
     "PocketXMol": PocketXMolCliGenerator,
     "PocketXMolAR": PocketXMolARCliGenerator,
 }
