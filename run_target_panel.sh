@@ -5,7 +5,7 @@ CHORUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Overnight panel default; override N_PER_POCKET for pilots or deeper focused runs.
 RUN_PREFIX="${RUN_PREFIX:-panel_$(date +%Y%m%d)}"
-N_PER_POCKET="${N_PER_POCKET:-1500}"
+N_PER_POCKET="${N_PER_POCKET:-1000}"
 P2RANK_MAX_POCKETS="${P2RANK_MAX_POCKETS:-4}"
 P2RANK_MIN_SCORE="${P2RANK_MIN_SCORE:-0.5}"
 GENERATORS="${GENERATORS:-DiffSBDD,DiffSBDDJoint,PocketXMol,PocketXMolAR}"
@@ -24,7 +24,6 @@ mkdir -p "$LOG_DIR"
 # Format: "PDB_ID TARGET_NAME"
 # PROTAC-relevant panel: cancer targets plus canonical degradation targets/E3 ligases.
 TARGETS=(
-    "4J3I KRAS"
     "8VF6 STK33"
     "2PN7 GGCT"
     "3MXF BRD4_BD1"
@@ -35,6 +34,7 @@ TARGETS=(
     "1IEP ABL1"
     "3CS9 CDK2"
     "4OQ3 BCL2"
+    "4J3I KRAS"
 )
 
 if [[ -n "$TARGETS_OVERRIDE" ]]; then
