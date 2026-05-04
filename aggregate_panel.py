@@ -20,6 +20,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_GLOB = "results/panel_20260503_*"
@@ -392,6 +394,123 @@ def fig_jaccard(jacc: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
+MAX_PCA_POINTS = 15_000  # subsample for speed; keeps scatter readable
+
+
+def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
+    """2-row figure: score boxplots (top) + pooled PCA colored 3 ways (bottom)."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit.DataStructs import ConvertToNumpyArray
+    from sklearn.decomposition import PCA
+
+    # --- compute Morgan FPs ---
+    df = scored.dropna(subset=["smiles", "score"]).copy()
+    df = df[df["generator"].isin(GENERATOR_ORDER)].reset_index(drop=True)
+
+    fps, keep = [], []
+    for i, smi in enumerate(df["smiles"].values):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        bv = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+        arr = np.zeros(2048, dtype=np.float32)
+        ConvertToNumpyArray(bv, arr)
+        fps.append(arr)
+        keep.append(i)
+    df = df.iloc[keep].reset_index(drop=True)
+    X = np.vstack(fps)
+
+    # subsample for readability
+    if len(df) > MAX_PCA_POINTS:
+        idx = np.random.default_rng(0).choice(len(df), MAX_PCA_POINTS, replace=False)
+        df = df.iloc[idx].reset_index(drop=True)
+        X = X[idx]
+
+    pca = PCA(n_components=2, random_state=0)
+    coords = pca.fit_transform(X)
+    df["pc1"] = coords[:, 0]
+    df["pc2"] = coords[:, 1]
+
+    var1, var2 = pca.explained_variance_ratio_ * 100
+
+    targets_sorted = sorted(df["target"].unique())
+    n_targets = len(targets_sorted)
+    target_cmap = plt.get_cmap("tab10" if n_targets <= 10 else "tab20")
+    target_color = {t: target_cmap(i / max(n_targets - 1, 1)) for i, t in enumerate(targets_sorted)}
+
+    alpha = min(0.5, max(0.1, 5000 / len(df)))
+    s = 3
+
+    fig = plt.figure(figsize=(13, 7.5))
+    gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.32,
+                          height_ratios=[1, 1.3])
+
+    # ── top row: boxplots ──────────────────────────────────────────────────
+    ax_gen = fig.add_subplot(gs[0, 0])
+    data_gen = [scored[scored["generator"] == g]["score"].values for g in GENERATOR_ORDER]
+    bp = ax_gen.boxplot(data_gen, labels=GENERATOR_ORDER, patch_artist=True, showfliers=False)
+    for patch, g in zip(bp["boxes"], GENERATOR_ORDER):
+        patch.set_facecolor(GENERATOR_COLOR[g])
+        patch.set_alpha(0.7)
+    ax_gen.set_ylabel("RTMScore (best pose per mol)")
+    ax_gen.set_title("Score by generator\n(all targets pooled)")
+
+    ax_tgt = fig.add_subplot(gs[0, 1:])
+    data_tgt = [scored[scored["target"] == t]["score"].values for t in targets_sorted]
+    bp2 = ax_tgt.boxplot(data_tgt, labels=targets_sorted, patch_artist=True, showfliers=False)
+    for patch in bp2["boxes"]:
+        patch.set_facecolor("#BBBBBB")
+    ax_tgt.set_title("Score by target")
+    ax_tgt.tick_params(axis="x", rotation=30)
+
+    # ── bottom row: PCA panels ─────────────────────────────────────────────
+    xlabel = f"PC1 ({var1:.1f}%)"
+    ylabel = f"PC2 ({var2:.1f}%)"
+
+    # Panel 1: colored by RTMScore
+    ax_sc = fig.add_subplot(gs[1, 0])
+    norm = Normalize(vmin=df["score"].quantile(0.02), vmax=df["score"].quantile(0.98))
+    sc = ax_sc.scatter(df["pc1"], df["pc2"], c=df["score"], cmap="plasma",
+                       norm=norm, s=s, alpha=alpha, linewidths=0)
+    plt.colorbar(ScalarMappable(norm=norm, cmap="plasma"), ax=ax_sc,
+                 label="RTMScore", pad=0.02, shrink=0.85)
+    ax_sc.set_title("Pooled chemical space\n(colored by RTMScore)")
+    ax_sc.set_xlabel(xlabel); ax_sc.set_ylabel(ylabel)
+    ax_sc.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    # Panel 2: colored by generator
+    ax_ge = fig.add_subplot(gs[1, 1])
+    for g in GENERATOR_ORDER:
+        sub = df[df["generator"] == g]
+        ax_ge.scatter(sub["pc1"], sub["pc2"], c=GENERATOR_COLOR[g],
+                      label=g, s=s, alpha=alpha, linewidths=0)
+    ax_ge.legend(title="Generator", fontsize=7, markerscale=3,
+                 loc="upper right", framealpha=0.8)
+    ax_ge.set_title("Pooled chemical space\n(colored by generator)")
+    ax_ge.set_xlabel(xlabel); ax_ge.set_ylabel(ylabel)
+    ax_ge.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    # Panel 3: colored by target
+    ax_ta = fig.add_subplot(gs[1, 2])
+    for t in targets_sorted:
+        sub = df[df["target"] == t]
+        ax_ta.scatter(sub["pc1"], sub["pc2"], c=[target_color[t]],
+                      label=t, s=s, alpha=alpha, linewidths=0)
+    ax_ta.legend(title="Target", fontsize=6, markerscale=3,
+                 loc="upper right", framealpha=0.8,
+                 ncol=2 if n_targets > 6 else 1)
+    ax_ta.set_title("Pooled chemical space\n(colored by target)")
+    ax_ta.set_xlabel(xlabel); ax_ta.set_ylabel(ylabel)
+    ax_ta.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    fig.suptitle("Score distributions and chemical-space structure (all targets pooled)",
+                 fontsize=12, y=1.01)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-glob", default=DEFAULT_GLOB)
@@ -459,6 +578,9 @@ def main() -> None:
         fig_score_vs_ra(scored, OUT_FIGS / "fig5_score_vs_ra.png")
         if not mvc.empty:
             fig_marginal_vs_conditional(mvc, OUT_FIGS / "fig6_marginal_vs_conditional_ra.png")
+
+    if not scored.empty:
+        fig_score_overview(scored, OUT_FIGS / "fig0_score_overview.png")
 
     print(f"\nWrote tables to {OUT_TABLES} and figures to {OUT_FIGS}")
 
