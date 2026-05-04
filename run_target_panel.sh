@@ -33,9 +33,9 @@ TARGETS=(
     "4CI2 CRBN"
     "4HG7 MDM2"
     "1IEP ABL1"
-    "3CS9 CDK2"
-    "4OQ3 BCL2"
-    "4J3I KRAS"
+    # "3CS9 CDK2"
+    # "4OQ3 BCL2"
+    # "4J3I KRAS"
 )
 
 if [[ -n "$TARGETS_OVERRIDE" ]]; then
