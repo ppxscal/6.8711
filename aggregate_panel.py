@@ -244,13 +244,15 @@ def fig_score_boxplots(scored: pd.DataFrame, out_path: Path) -> None:
 
 def fig_top_enrichment(enrich: pd.DataFrame, out_path: Path, frac: float = 0.05) -> None:
     pivot = enrich.pivot(index="target", columns="generator", values="fraction_of_top").reindex(columns=GENERATOR_ORDER)
-    fig, ax = plt.subplots(figsize=(6, 3.5))
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
     pivot.plot(kind="bar", ax=ax, color=[GENERATOR_COLOR[g] for g in GENERATOR_ORDER],
-               edgecolor="black", linewidth=0.5)
+               edgecolor="black", linewidth=0.5, width=0.8)
     ax.axhline(1 / len(GENERATOR_ORDER), color="grey", ls="--", lw=0.8, label="equal share")
     ax.set_ylabel(f"Fraction of top-{int(frac*100)}% hits")
     ax.set_title(f"Generator share of top-{int(frac*100)}% RTMScore (per target)")
-    ax.legend(title=None, fontsize=8)
+    ax.set_ylim(0, min(1.0, pivot.values.max() * 1.15 + 0.05))
+    ax.legend(title=None, fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5),
+              frameon=False)
     ax.tick_params(axis="x", rotation=30)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -290,6 +292,70 @@ def fig_score_vs_ra(scored: pd.DataFrame, out_path: Path) -> None:
             patch.set_facecolor(GENERATOR_COLOR[g]); patch.set_alpha(0.7)
         axes[1].set_ylabel("RA score among top-5% scorers")
         axes[1].set_title("Are top hits synthesizable?")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    fig.savefig(out_path.with_suffix(".pdf"))
+    plt.close(fig)
+
+
+def marginal_vs_conditional_ra(scored: pd.DataFrame, frac: float = 0.05) -> pd.DataFrame:
+    """Compare marginal (all-mols) vs conditional (top-5% scorer) synthesizability/drug-likeness.
+
+    This is the empirical demonstration that current SBDD reporting practice
+    (marginal averages, e.g. PocketXMol's SA table) conceals the
+    score-vs-synthesizability tradeoff that surfaces only when conditioning on top-K.
+    """
+    if "ra_score" not in scored.columns:
+        return pd.DataFrame()
+    rows = []
+    # Build top-K mask per target, then pool across targets by generator.
+    top_flag = pd.Series(False, index=scored.index)
+    for target, sub in scored.groupby("target"):
+        k = max(1, int(np.ceil(len(sub) * frac)))
+        thr = sub["score"].nlargest(k).min()
+        top_flag.loc[sub.index] = sub["score"] >= thr
+    scored = scored.copy()
+    scored["is_top"] = top_flag
+
+    for g, sub in scored.groupby("generator"):
+        full = sub.dropna(subset=["ra_score"])
+        top = full[full["is_top"]]
+        rows.append({
+            "generator": g,
+            "n_all": len(full),
+            "marginal_ra_mean": full["ra_score"].mean(),
+            "marginal_ra_median": full["ra_score"].median(),
+            "marginal_qed_mean": full["qed"].mean(),
+            "marginal_qed_median": full["qed"].median(),
+            "n_top5pct": len(top),
+            "conditional_ra_mean": top["ra_score"].mean(),
+            "conditional_ra_median": top["ra_score"].median(),
+            "conditional_qed_mean": top["qed"].mean(),
+            "conditional_qed_median": top["qed"].median(),
+            "ra_gap_marginal_minus_conditional": full["ra_score"].median() - top["ra_score"].median(),
+        })
+    return pd.DataFrame(rows).set_index("generator").reindex(GENERATOR_ORDER).reset_index()
+
+
+def fig_marginal_vs_conditional(mvc: pd.DataFrame, out_path: Path) -> None:
+    if mvc.empty:
+        return
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    x = np.arange(len(GENERATOR_ORDER))
+    w = 0.35
+    ax.bar(x - w/2, mvc["marginal_ra_median"], w,
+           label="All molecules (marginal)", color="#999999",
+           edgecolor="black", linewidth=0.5)
+    ax.bar(x + w/2, mvc["conditional_ra_median"], w,
+           label="Top-5% RTMScore (conditional)",
+           color=[GENERATOR_COLOR[g] for g in GENERATOR_ORDER],
+           edgecolor="black", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(GENERATOR_ORDER)
+    ax.set_ylabel("Median RA score")
+    ax.set_title("Marginal vs. conditional synthesizability\n(current SBDD reporting = left bars; what leaderboards actually select = right bars)")
+    ax.legend(fontsize=8, loc="lower left")
+    ax.set_ylim(0, 1)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     fig.savefig(out_path.with_suffix(".pdf"))
@@ -367,6 +433,8 @@ def main() -> None:
         diff.to_csv(OUT_TABLES / "pocket_difficulty.csv", index=False)
         variance = per_target_generator_variance(scored)
         variance.to_csv(OUT_TABLES / "score_variance_by_target_generator.csv", index=False)
+        mvc = marginal_vs_conditional_ra(scored, frac=0.05)
+        mvc.to_csv(OUT_TABLES / "marginal_vs_conditional_ra.csv", index=False)
 
         print("\n=== Top-5% share by (target, generator) ===")
         print(enrich.pivot(index="target", columns="generator", values="fraction_of_top")
@@ -374,6 +442,12 @@ def main() -> None:
 
         print("\n=== Top-5% Jaccard across generators ===")
         print(jacc.groupby(["gen_a", "gen_b"])["jaccard"].mean().round(4).to_string())
+
+        if not mvc.empty:
+            print("\n=== Marginal (all mols) vs. Conditional (top-5%) synthesizability ===")
+            show = mvc[["generator", "marginal_ra_median", "conditional_ra_median",
+                        "marginal_qed_median", "conditional_qed_median"]]
+            print(show.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 
     # --- Figures ---
     if not pred.empty:
@@ -383,6 +457,8 @@ def main() -> None:
         fig_top_enrichment(enrich, OUT_FIGS / "fig3_top5_enrichment.png")
         fig_jaccard(jacc, OUT_FIGS / "fig4_top5_jaccard.png")
         fig_score_vs_ra(scored, OUT_FIGS / "fig5_score_vs_ra.png")
+        if not mvc.empty:
+            fig_marginal_vs_conditional(mvc, OUT_FIGS / "fig6_marginal_vs_conditional_ra.png")
 
     print(f"\nWrote tables to {OUT_TABLES} and figures to {OUT_FIGS}")
 
