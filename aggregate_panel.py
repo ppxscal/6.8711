@@ -402,7 +402,7 @@ def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
     from rdkit import Chem
     from rdkit.Chem import AllChem
     from rdkit.DataStructs import ConvertToNumpyArray
-    from sklearn.decomposition import PCA
+    import umap
 
     # --- compute Morgan FPs ---
     df = scored.dropna(subset=["smiles", "score"]).copy()
@@ -427,12 +427,11 @@ def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
         df = df.iloc[idx].reset_index(drop=True)
         X = X[idx]
 
-    pca = PCA(n_components=2, random_state=0)
-    coords = pca.fit_transform(X)
-    df["pc1"] = coords[:, 0]
-    df["pc2"] = coords[:, 1]
-
-    var1, var2 = pca.explained_variance_ratio_ * 100
+    reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.1,
+                        metric="jaccard", random_state=0, low_memory=False)
+    coords = reducer.fit_transform(X)
+    df["u1"] = coords[:, 0]
+    df["u2"] = coords[:, 1]
 
     targets_sorted = sorted(df["target"].unique())
     n_targets = len(targets_sorted)
@@ -459,20 +458,21 @@ def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
     ax_tgt = fig.add_subplot(gs[0, 1:])
     data_tgt = [scored[scored["target"] == t]["score"].values for t in targets_sorted]
     bp2 = ax_tgt.boxplot(data_tgt, labels=targets_sorted, patch_artist=True, showfliers=False)
-    for patch in bp2["boxes"]:
-        patch.set_facecolor("#BBBBBB")
+    for patch, t in zip(bp2["boxes"], targets_sorted):
+        patch.set_facecolor(target_color[t])
+        patch.set_alpha(0.7)
     ax_tgt.set_title("Score by target")
     ax_tgt.tick_params(axis="x", rotation=30)
 
-    # ── bottom row: PCA panels ─────────────────────────────────────────────
-    xlabel = f"PC1 ({var1:.1f}%)"
-    ylabel = f"PC2 ({var2:.1f}%)"
+    # ── bottom row: UMAP panels ────────────────────────────────────────────
+    xlabel = "UMAP 1"
+    ylabel = "UMAP 2"
 
     # Panel 1: colored by RTMScore
     ax_sc = fig.add_subplot(gs[1, 0])
     norm = Normalize(vmin=df["score"].quantile(0.02), vmax=df["score"].quantile(0.98))
-    sc = ax_sc.scatter(df["pc1"], df["pc2"], c=df["score"], cmap="plasma",
-                       norm=norm, s=s, alpha=alpha, linewidths=0)
+    ax_sc.scatter(df["u1"], df["u2"], c=df["score"], cmap="plasma",
+                  norm=norm, s=s, alpha=alpha, linewidths=0)
     plt.colorbar(ScalarMappable(norm=norm, cmap="plasma"), ax=ax_sc,
                  label="RTMScore", pad=0.02, shrink=0.85)
     ax_sc.set_title("Pooled chemical space\n(colored by RTMScore)")
@@ -483,7 +483,7 @@ def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
     ax_ge = fig.add_subplot(gs[1, 1])
     for g in GENERATOR_ORDER:
         sub = df[df["generator"] == g]
-        ax_ge.scatter(sub["pc1"], sub["pc2"], c=GENERATOR_COLOR[g],
+        ax_ge.scatter(sub["u1"], sub["u2"], c=GENERATOR_COLOR[g],
                       label=g, s=s, alpha=alpha, linewidths=0)
     ax_ge.legend(title="Generator", fontsize=7, markerscale=3,
                  loc="upper right", framealpha=0.8)
@@ -495,7 +495,7 @@ def fig_score_overview(scored: pd.DataFrame, out_path: Path) -> None:
     ax_ta = fig.add_subplot(gs[1, 2])
     for t in targets_sorted:
         sub = df[df["target"] == t]
-        ax_ta.scatter(sub["pc1"], sub["pc2"], c=[target_color[t]],
+        ax_ta.scatter(sub["u1"], sub["u2"], c=[target_color[t]],
                       label=t, s=s, alpha=alpha, linewidths=0)
     ax_ta.legend(title="Target", fontsize=6, markerscale=3,
                  loc="upper right", framealpha=0.8,
